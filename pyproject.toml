@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matrix-compute-sdk"
+version = "0.1.0"
+description = "Production-grade consumer Python library and orchestrator for distributed matrix multiplication over decentralized compute nodes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Distributed Matrix Multiply Team" }
+]
+keywords = [
+    "distributed-computing",
+    "matrix-multiplication",
+    "freivalds",
+    "l402",
+    "nostr",
+    "grpc",
+    "p2p",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "matrix-contracts",
+    "numpy>=1.22.0",
+    "grpcio>=1.50.0",
+    "protobuf>=4.21.0",
+    "pydantic>=2.0.0",
+    "cryptography>=39.0.0",
+    "coincurve>=18.0.0",
+    "httpx>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "grpcio-tools>=1.50.0",
+]
+
+[project.scripts]
+matrix-compute = "matrix_compute.client:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["matrix_compute*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+pythonpath = [
+    "src",
+    "../matrix-contracts",
+]

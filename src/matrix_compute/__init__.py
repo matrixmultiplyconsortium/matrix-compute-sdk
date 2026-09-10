@@ -1,0 +1,237 @@
+"""
+matrix-compute-sdk (`matrix_compute`): Production-grade consumer Python library and
+orchestrator for distributed matrix multiplication over decentralized compute nodes.
+"""
+
+from .client import MatrixComputeClient, distributed_matmul
+from .config import ClientConfig, get_default_config
+from .crypto import (
+    ClientSigner,
+    generate_keypair,
+    hash_tensor,
+    sha256_digest,
+    sign_message,
+    verify_signature,
+    verify_tile_result_signature,
+)
+from .discovery import (
+    DiscoveredWorker,
+    Matchmaker,
+    MatchResult,
+    RelayClient,
+    RelayStatus,
+)
+from .exceptions import (
+    BudgetExceededError,
+    ConfigurationError,
+    DiscoveryError,
+    DispatchError,
+    EscrowCreationError,
+    EscrowError,
+    EscrowStateError,
+    EscrowTimeoutError,
+    FraudDetectedError,
+    InvalidNostrEventError,
+    InvoiceHoldError,
+    L402ChallengeError,
+    MacaroonError,
+    MacaroonValidationError,
+    MatrixComputeError,
+    MatrixDimensionError,
+    NoWorkersFoundError,
+    PaymentError,
+    PreimageVerificationError,
+    RefundError,
+    RelayConnectionError,
+    RelayPoolExhaustedError,
+    SettlementError,
+    StreamingError,
+    TaskDispatchError,
+    TaskTimeoutError,
+    TilingError,
+    VerificationFailedError,
+    WorkerConnectionError,
+    WorkerSignatureError,
+    WorkerTaskRejectedError,
+    WorkerUnavailableError,
+)
+from .orchestrator import (
+    ComputeCoordinator,
+    CoordinatorState,
+    DistributedMatmulCoordinator,
+    JobManifest,
+    ParallelTaskScheduler,
+    TaskScheduler,
+    WorkerSlotTracker,
+)
+from .p2p import (
+    ChannelPool,
+    DispatchedTileResult,
+    GrpcChannelPool,
+    GrpcTaskDispatcher,
+    multiaddr_to_target,
+    parse_multiaddr,
+)
+from .payment import (
+    BudgetController,
+    EscrowManager,
+    EscrowState,
+    EscrowStatus,
+    HttpSettlementBackend,
+    L402Challenge,
+    L402PaymentCoordinator,
+    MacaroonCaveats,
+    MacaroonToken,
+    MockSettlementBackend,
+    SettlementBackendProtocol,
+    format_auth_header,
+    format_grpc_metadata,
+    generate_escrow_secret,
+    validate_preimage,
+)
+from .test_doubles import (
+    MockNostrRelay,
+    MockSettlementService,
+    MockWorkerNode,
+)
+from .tiling import (
+    MatrixTiler,
+    ResultAssembler,
+    TileGridPlan,
+    TileTaskPlan,
+    calculate_higham_bound,
+    cast_matrix,
+    emulate_gemm,
+    get_bytes_per_element,
+    get_numpy_dtype,
+    get_unit_roundoff,
+    normalize_dtype,
+    truncate_to_bf16,
+    validate_bf16_masking,
+)
+from .verification import (
+    FraudProofBuilder,
+    FreivaldsVerifier,
+    create_fraud_dispute,
+    freivalds_verify,
+    verify_fraud_proof,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "__version__",
+    # Client & High-Level API
+    "MatrixComputeClient",
+    "distributed_matmul",
+    # Configuration
+    "ClientConfig",
+    "get_default_config",
+    # Base Exception
+    "MatrixComputeError",
+    # Configuration & Geometry Errors
+    "ConfigurationError",
+    "MatrixDimensionError",
+    "TilingError",
+    # Discovery Errors
+    "DiscoveryError",
+    "WorkerUnavailableError",
+    "NoWorkersFoundError",
+    "RelayConnectionError",
+    "RelayPoolExhaustedError",
+    "InvalidNostrEventError",
+    "WorkerConnectionError",
+    # Dispatch & Streaming Errors
+    "DispatchError",
+    "WorkerTaskRejectedError",
+    "StreamingError",
+    "TaskDispatchError",
+    "TaskTimeoutError",
+    "WorkerSignatureError",
+    # Payment & Settlement Errors
+    "PaymentError",
+    "L402ChallengeError",
+    "MacaroonError",
+    "MacaroonValidationError",
+    "BudgetExceededError",
+    "EscrowError",
+    "EscrowCreationError",
+    "InvoiceHoldError",
+    "SettlementError",
+    "RefundError",
+    "EscrowStateError",
+    "EscrowTimeoutError",
+    "PreimageVerificationError",
+    # Verification & Fraud Errors
+    "VerificationFailedError",
+    "FraudDetectedError",
+    # Crypto Subsystem
+    "ClientSigner",
+    "generate_keypair",
+    "sign_message",
+    "verify_signature",
+    "verify_tile_result_signature",
+    "sha256_digest",
+    "hash_tensor",
+    # Discovery Subsystem
+    "DiscoveredWorker",
+    "Matchmaker",
+    "MatchResult",
+    "RelayClient",
+    "RelayStatus",
+    # Payment Subsystem
+    "L402Challenge",
+    "MacaroonToken",
+    "MacaroonCaveats",
+    "BudgetController",
+    "L402PaymentCoordinator",
+    "EscrowManager",
+    "EscrowState",
+    "EscrowStatus",
+    "SettlementBackendProtocol",
+    "MockSettlementBackend",
+    "HttpSettlementBackend",
+    "format_auth_header",
+    "format_grpc_metadata",
+    "generate_escrow_secret",
+    "validate_preimage",
+    # Tiling Subsystem
+    "MatrixTiler",
+    "TileTaskPlan",
+    "TileGridPlan",
+    "ResultAssembler",
+    "normalize_dtype",
+    "get_numpy_dtype",
+    "get_bytes_per_element",
+    "truncate_to_bf16",
+    "cast_matrix",
+    "validate_bf16_masking",
+    "get_unit_roundoff",
+    "calculate_higham_bound",
+    "emulate_gemm",
+    # Verification Subsystem
+    "FreivaldsVerifier",
+    "freivalds_verify",
+    "FraudProofBuilder",
+    "verify_fraud_proof",
+    "create_fraud_dispute",
+    # P2P Subsystem
+    "ChannelPool",
+    "GrpcChannelPool",
+    "GrpcTaskDispatcher",
+    "DispatchedTileResult",
+    "parse_multiaddr",
+    "multiaddr_to_target",
+    # Orchestrator Subsystem
+    "ParallelTaskScheduler",
+    "TaskScheduler",
+    "WorkerSlotTracker",
+    "DistributedMatmulCoordinator",
+    "ComputeCoordinator",
+    "CoordinatorState",
+    "JobManifest",
+    # Test Doubles
+    "MockNostrRelay",
+    "MockSettlementService",
+    "MockWorkerNode",
+]
