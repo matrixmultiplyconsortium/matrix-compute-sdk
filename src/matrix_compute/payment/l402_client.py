@@ -506,9 +506,17 @@ class MockSettlementBackend:
 class HttpSettlementBackend:
     """HTTP REST settlement client for production settlement servers."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8080", timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8080",
+        timeout: float = 10.0,
+        timeout_seconds: Optional[float] = None,
+        verification_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.timeout = float(timeout)
+        self.timeout = float(timeout_seconds if timeout_seconds is not None else timeout)
+        self.verification_key = verification_key
 
     def create_hodl_invoice(
         self,
