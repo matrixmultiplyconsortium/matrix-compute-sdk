@@ -154,16 +154,18 @@ class DistributedMatmulCoordinator:
 
         # 4. Pre-group scheduled tasks by assigned worker
         num_workers = len(workers)
-        worker_tasks: Dict[Any, List[TileTaskPlan]] = collections.defaultdict(list)
+        worker_task_groups: List[Tuple[Any, List[TileTaskPlan]]] = [
+            (w, []) for w in workers
+        ]
         for idx, task_plan in enumerate(grid_plan.tasks):
-            assigned_worker = workers[idx % num_workers]
-            worker_tasks[assigned_worker].append(task_plan)
+            worker_task_groups[idx % num_workers][1].append(task_plan)
 
-        worker_escrows: Dict[Any, Any] = {}
+        active_groups = [(w, tasks) for w, tasks in worker_task_groups if tasks]
         total_sats_spent = 0
 
         # Provision 1 batch escrow per worker
-        for assigned_worker, tasks in worker_tasks.items():
+        worker_group_escrows: List[Tuple[Any, List[TileTaskPlan], Any]] = []
+        for g_idx, (assigned_worker, tasks) in enumerate(active_groups):
             assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
             sats_per_gflop = getattr(assigned_worker, "sats_per_gflop", self.config.max_price_per_gflop)
             total_sats = sum(max(int(math.ceil(t.estimated_gflops * sats_per_gflop)), 10) for t in tasks)
@@ -176,12 +178,13 @@ class DistributedMatmulCoordinator:
                 getattr(assigned_worker, "lightning_address", "worker@node"),
             )
             task_ids = [t.task_id for t in tasks]
+            batch_job_id = f"{job_id}_b{g_idx}" if len(active_groups) > 1 else job_id
 
             if hasattr(self.escrow_manager, "create_batch_escrow"):
                 escrow = self.escrow_manager.create_batch_escrow(
                     worker_pubkey=assigned_pubkey,
                     task_ids=task_ids,
-                    job_id=job_id,
+                    job_id=batch_job_id,
                     total_sats=total_sats,
                     worker_lightning_addr=worker_ln,
                     timeout_seconds=self.config.task_timeout_seconds,
@@ -201,11 +204,10 @@ class DistributedMatmulCoordinator:
             elif hasattr(self.escrow_manager, "lock_escrow"):
                 self.escrow_manager.lock_escrow(escrow.payment_hash)
 
-            worker_escrows[assigned_worker] = escrow
+            worker_group_escrows.append((assigned_worker, tasks, escrow))
 
         # 5. Dispatch tiles and verify
-        for assigned_worker, tasks in worker_tasks.items():
-            escrow = worker_escrows[assigned_worker]
+        for assigned_worker, tasks, escrow in worker_group_escrows:
             assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
             candidates = [assigned_worker] + [
                 w for w in workers
