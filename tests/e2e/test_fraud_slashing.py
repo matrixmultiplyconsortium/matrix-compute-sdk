@@ -329,3 +329,112 @@ class TestTier3FraudAndSlashing:
         failed_tiles = [k for k, v in tile_status.items() if v == "FRAUD_DETECTED"]
         assert len(passed_tiles) == 3
         assert failed_tiles == ["tile_0_1"]
+
+    def test_t3_15_batch_fraud_halts_batch_and_slashes_bond(self):
+        """
+        T3.15: Multi-tile batch fraud detection, immediate halting, and bond slashing.
+        When a worker cheats on a tile within a multi-tile batch escrow:
+        1. Freivalds verification fails on the tampered tile.
+        2. Immediate halting: subsequent tiles in the worker's batch are NOT dispatched/executed.
+        3. The worker's batch escrow is cancelled (preimage withheld).
+        4. Fraud proof is submitted and the worker's staked bond is slashed on the settlement backend.
+        5. FraudDetectedError is raised with the authoritative FreivaldsFraudProof.
+        """
+        from matrix_compute.config import ClientConfig
+        from matrix_compute.crypto.signer import ClientSigner
+        from matrix_compute.discovery.matchmaker import Matchmaker
+        from matrix_compute.discovery.relay_client import RelayClient
+        from matrix_compute.exceptions import FraudDetectedError
+        from matrix_compute.orchestrator.coordinator import DistributedMatmulCoordinator
+        from matrix_compute.orchestrator.scheduler import ParallelTaskScheduler
+        from matrix_compute.p2p.dispatcher import GrpcTaskDispatcher
+        from matrix_compute.payment.backend import MockSettlementBackend
+        from matrix_compute.payment.escrow import EscrowManager, EscrowStatus
+        from matrix_compute.test_doubles.mock_relay import MockNostrRelay
+        from matrix_compute.test_doubles.mock_settlement import MockSettlementService
+        from matrix_compute.test_doubles.mock_worker import MockWorkerNode
+
+        settlement = MockSettlementService(verification_key="batch-fraud-test-vk")
+        relay = MockNostrRelay()
+
+        worker = MockWorkerNode(
+            settlement_service=settlement,
+            verification_key=settlement.verification_key,
+            vram_mb=24576,
+            sats_per_gflop=0.0005,
+        )
+
+        try:
+            worker.start()
+            worker.publish_to_relay(relay)
+
+            # Stake bond for worker in settlement backend
+            initial_bond = 500_000
+            settlement.stake_bond(worker.pubkey, initial_bond)
+            assert settlement.get_bond_balance(worker.pubkey) == initial_bond
+
+            # Tamper on task 2: task 1 succeeds, task 2 fails Freivalds verification
+            worker.set_tamper_on_task_count(2)
+            worker.servicer.tamper_perturbation = 50.0
+
+            config = ClientConfig(
+                offline_mock_mode=True,
+                nostr_relays=["ws://127.0.0.1:8008"],
+                settlement_api_url="http://127.0.0.1:8080",
+                settlement_verification_key=settlement.verification_key,
+                min_worker_vram_mb=8192,
+                max_price_per_gflop=0.001,
+                default_tile_size=16,
+                max_retries=0,
+            )
+
+            signer = ClientSigner()
+            relay_client = RelayClient(relay_urls=["ws://127.0.0.1:8008"], in_memory_relay=relay)
+            matchmaker = Matchmaker()
+            backend = MockSettlementBackend(settlement)
+            escrow_mgr = EscrowManager(settlement_backend=backend, verification_key=config.settlement_verification_key)
+            dispatcher = GrpcTaskDispatcher(consumer_pubkey=signer.get_pubkey_hex())
+            scheduler = ParallelTaskScheduler(dispatcher=dispatcher, max_retries=0)
+
+            coordinator = DistributedMatmulCoordinator(
+                config=config,
+                signer=signer,
+                relay_client=relay_client,
+                matchmaker=matchmaker,
+                escrow_manager=escrow_mgr,
+                scheduler=scheduler,
+                dispatcher=dispatcher,
+                mock_workers=[worker],
+            )
+
+            # 32x16 x 16x32 with tile_size=16 -> 2 x 1 x 2 = 4 tiles for this single worker
+            np.random.seed(99)
+            A = np.random.randn(32, 16).astype(np.float32)
+            B = np.random.randn(16, 32).astype(np.float32)
+
+            with pytest.raises(FraudDetectedError) as exc_info:
+                coordinator.matmul(A, B, dtype="fp32", tile_size=16)
+
+            assert "Freivalds verification failed" in str(exc_info.value)
+            proof = exc_info.value.fraud_proof
+            assert proof is not None
+            assert proof.worker_pubkey == worker.pubkey
+
+            # Verify immediate halting: only 2 tasks were executed (task 1 passed, task 2 failed, tasks 3 & 4 were halted!)
+            assert worker.servicer.task_count == 2
+
+            # Verify batch escrow was cancelled
+            unique_escrows = {e.payment_hash: e for e in escrow_mgr._escrows.values()}
+            assert len(unique_escrows) == 1
+            batch_escrow = list(unique_escrows.values())[0]
+            assert batch_escrow.is_batch is True
+            assert batch_escrow.status == EscrowStatus.CANCELLED
+            assert settlement.get_status(batch_escrow.payment_hash) == "CANCELLED"
+
+            # Verify worker's bond was slashed on settlement backend
+            current_bond = settlement.get_bond_balance(worker.pubkey)
+            assert current_bond < initial_bond
+            assert initial_bond - current_bond == 100_000  # Default slash amount
+        finally:
+            worker.stop()
+

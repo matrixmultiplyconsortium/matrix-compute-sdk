@@ -1383,3 +1383,120 @@ class TestTier2BoundaryCornerCases:
         mock_relay.publish({"kind": 30000, "pubkey": "p1", "tags": [["d", "matrix-worker"]]})
         results = mock_relay.query(min_vram_mb=999999)
         assert results == []
+
+
+# ==============================================================================
+# Tier 4: Coordinator Batch Scheduling & Worker-Grouped Batch Escrows (M4)
+# ==============================================================================
+
+class TestTier4BatchCoordinatorScheduling:
+    """
+    Tier 4: Milestone 4 Coordinator Batch Scheduling & Worker-Grouped Batch Escrows.
+    Tests that:
+    1. A multi-tile workload (16 tiles) distributed across 2 workers creates exactly 1 batch escrow
+       per worker (2 batch escrows total), NOT 16 individual escrows.
+    2. Each batch escrow contains the constituent task_ids in its metadata and macaroon caveats.
+    3. Both workers execute their constituent tiles through the L402 gate using the batch macaroon.
+    4. Upon successful completion and Freivalds verification of all tiles, preimages are released
+       atomically and both batch escrows transition to SETTLED.
+    5. The final assembled matrix matches reference np.matmul(A, B).
+    """
+
+    def test_coordinator_worker_grouped_batch_escrows(self):
+        from matrix_compute.config import ClientConfig
+        from matrix_compute.crypto.signer import ClientSigner
+        from matrix_compute.discovery.matchmaker import Matchmaker
+        from matrix_compute.discovery.relay_client import RelayClient
+        from matrix_compute.orchestrator.coordinator import DistributedMatmulCoordinator
+        from matrix_compute.orchestrator.scheduler import ParallelTaskScheduler
+        from matrix_compute.p2p.dispatcher import GrpcTaskDispatcher
+        from matrix_compute.payment.backend import MockSettlementBackend
+        from matrix_compute.payment.escrow import EscrowManager, EscrowStatus
+        from matrix_compute.test_doubles.mock_relay import MockNostrRelay
+        from matrix_compute.test_doubles.mock_settlement import MockSettlementService
+        from matrix_compute.test_doubles.mock_worker import MockWorkerNode
+
+        settlement = MockSettlementService(verification_key="batch-test-secret-key-m4")
+        relay = MockNostrRelay()
+
+        worker1 = MockWorkerNode(
+            settlement_service=settlement,
+            verification_key=settlement.verification_key,
+            vram_mb=24576,
+            sats_per_gflop=0.0005,
+        )
+        worker2 = MockWorkerNode(
+            settlement_service=settlement,
+            verification_key=settlement.verification_key,
+            vram_mb=24576,
+            sats_per_gflop=0.0005,
+        )
+
+        try:
+            worker1.start()
+            worker2.start()
+
+            worker1.publish_to_relay(relay)
+            worker2.publish_to_relay(relay)
+
+            config = ClientConfig(
+                offline_mock_mode=True,
+                nostr_relays=["ws://127.0.0.1:8008"],
+                settlement_api_url="http://127.0.0.1:8080",
+                settlement_verification_key=settlement.verification_key,
+                min_worker_vram_mb=8192,
+                max_price_per_gflop=0.001,
+                default_tile_size=16,
+                max_retries=0,
+            )
+
+            signer = ClientSigner()
+            relay_client = RelayClient(relay_urls=["ws://127.0.0.1:8008"], in_memory_relay=relay)
+            matchmaker = Matchmaker()
+            backend = MockSettlementBackend(settlement)
+            escrow_mgr = EscrowManager(settlement_backend=backend, verification_key=config.settlement_verification_key)
+            dispatcher = GrpcTaskDispatcher(consumer_pubkey=signer.get_pubkey_hex())
+            scheduler = ParallelTaskScheduler(dispatcher=dispatcher, max_retries=0)
+
+            coordinator = DistributedMatmulCoordinator(
+                config=config,
+                signer=signer,
+                relay_client=relay_client,
+                matchmaker=matchmaker,
+                escrow_manager=escrow_mgr,
+                scheduler=scheduler,
+                dispatcher=dispatcher,
+                mock_workers=[worker1, worker2],
+            )
+
+            # 64x16 x 16x64 with tile_size=16 -> 4 x 1 x 4 = 16 tiles
+            np.random.seed(42)
+            A = np.random.randn(64, 16).astype(np.float32)
+            B = np.random.randn(16, 64).astype(np.float32)
+
+            result = coordinator.matmul(A, B, dtype="fp32", tile_size=16)
+
+            # Check dimensions and precision
+            assert result.shape == (64, 64)
+            expected = np.matmul(A, B)
+            np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+            # Escrows created were worker-grouped batch escrows
+            unique_escrows = {e.payment_hash: e for e in escrow_mgr._escrows.values()}
+            assert len(unique_escrows) == 2, f"Expected exactly 2 batch escrows, got {len(unique_escrows)}"
+
+            total_tasks_in_escrows = 0
+            for phash, esc in unique_escrows.items():
+                assert esc.is_batch is True
+                assert esc.status == EscrowStatus.SETTLED
+                assert esc.preimage is not None
+                assert len(esc.task_ids) > 1
+                total_tasks_in_escrows += len(esc.task_ids)
+                assert settlement.get_status(phash) == "SETTLED"
+
+            assert total_tasks_in_escrows == 16
+            assert worker1.servicer.task_count + worker2.servicer.task_count == 16
+        finally:
+            worker1.stop()
+            worker2.stop()
+

@@ -638,3 +638,112 @@ def test_payment_coordinator_abort_and_refund(mock_settlement):
 
     assert coord.abort_and_refund(escrow, reason="worker_dropped") is True
     assert escrow.status == EscrowStatus.CANCELLED
+
+
+# =============================================================================
+# 10. Batch Escrow & Multi-Task Macaroon Unit Tests
+# =============================================================================
+
+def test_create_batch_escrow_multi_task_indexing(mock_settlement):
+    manager = EscrowManager(settlement_backend=mock_settlement)
+    task_ids = ["batch_t1", "batch_t2", "batch_t3"]
+    job_id = "job_test_batch_123"
+
+    escrow = manager.create_batch_escrow(
+        worker_pubkey="worker_pubkey_abc",
+        task_ids=task_ids,
+        job_id=job_id,
+        total_sats=300,
+        worker_lightning_addr="worker@node",
+        max_gflops=50.0,
+    )
+
+    assert escrow.status == EscrowStatus.INITIALIZED
+    assert escrow.is_batch is True
+    assert escrow.task_ids == task_ids
+    assert escrow.job_id == job_id
+    assert escrow.worker_pubkey == "worker_pubkey_abc"
+    assert escrow.total_compute_sats == 300
+
+    # Verify all task_ids resolve to the same batch escrow
+    for tid in task_ids:
+        resolved = manager.get_escrow(tid)
+        assert resolved is not None
+        assert resolved.payment_hash == escrow.payment_hash
+
+    # Verify resolution by job_id and payment_hash
+    assert manager._resolve_escrow(job_id).payment_hash == escrow.payment_hash
+    assert manager.get_by_payment_hash(escrow.payment_hash).job_id == job_id
+
+
+def test_macaroon_batch_caveat_containment_validation(verification_key):
+    # Mint token with task_ids list
+    task_ids = ["tile_0_0", "tile_0_1", "tile_1_0"]
+    caveats = {
+        "expiry": int(time.time() + 3600),
+        "locked_sats": 300,
+        "max_gflops": 100.0,
+        "payment_hash": "a" * 64,
+        "task_id": "tile_0_0",
+        "task_ids": task_ids,
+        "job_id": "job_xyz",
+    }
+    caveat_str = json.dumps(caveats, sort_keys=True)
+    sig = hmac.new(verification_key.encode("utf-8"), caveat_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    raw_b64 = base64.b64encode(json.dumps({"caveats": caveats, "signature": sig}).encode("utf-8")).decode("utf-8")
+
+    token = MacaroonToken.deserialize(raw_b64)
+    assert token.caveats.task_ids == task_ids
+    assert token.caveats.job_id == "job_xyz"
+
+    # All constituent tasks should validate
+    for tid in task_ids:
+        is_valid, err = token.validate(task_id=tid, m=32, k=32, n=32)
+        assert is_valid is True, f"Failed for {tid}: {err}"
+
+    # Non-constituent task must fail
+    is_valid, err = token.validate(task_id="outsider_tile", m=32, k=32, n=32)
+    assert is_valid is False
+    assert "not authorized in batch" in err or "mismatch" in err
+
+
+def test_settle_batch_releases_preimage(mock_settlement):
+    manager = EscrowManager(settlement_backend=mock_settlement)
+    task_ids = ["settle_t1", "settle_t2"]
+    job_id = "job_settle_batch_456"
+
+    escrow = manager.create_batch_escrow(
+        worker_pubkey="worker_pubkey_xyz",
+        task_ids=task_ids,
+        job_id=job_id,
+        total_sats=200,
+    )
+    manager.hold_escrow(escrow.payment_hash)
+    assert escrow.status == EscrowStatus.HELD
+
+    # Settle via job_id
+    settled = manager.settle_batch(job_id)
+    assert settled.status == EscrowStatus.SETTLED
+    assert settled.settled_at is not None
+    assert mock_settlement.get_status(escrow.payment_hash) == "SETTLED"
+
+
+def test_cancel_batch_on_failure(mock_settlement):
+    manager = EscrowManager(settlement_backend=mock_settlement)
+    task_ids = ["cancel_t1", "cancel_t2"]
+    job_id = "job_cancel_batch_789"
+
+    escrow = manager.create_batch_escrow(
+        worker_pubkey="worker_pubkey_xyz",
+        task_ids=task_ids,
+        job_id=job_id,
+        total_sats=200,
+    )
+    manager.hold_escrow(escrow.payment_hash)
+    assert escrow.status == EscrowStatus.HELD
+
+    cancelled = manager.cancel_batch(job_id, reason="freivalds_fraud_detected")
+    assert cancelled.status == EscrowStatus.CANCELLED
+    assert cancelled.cancellation_reason == "freivalds_fraud_detected"
+    assert mock_settlement.get_status(escrow.payment_hash) == "CANCELLED"
+

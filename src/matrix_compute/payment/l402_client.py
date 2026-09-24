@@ -136,6 +136,8 @@ class MacaroonCaveats:
     max_gflops: float
     locked_sats: int
     worker_pubkey: Optional[str] = None
+    task_ids: Optional[List[str]] = None
+    job_id: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -149,6 +151,10 @@ class MacaroonCaveats:
         }
         if self.worker_pubkey:
             d["worker_pubkey"] = self.worker_pubkey
+        if self.task_ids is not None:
+            d["task_ids"] = list(self.task_ids)
+        if self.job_id is not None:
+            d["job_id"] = self.job_id
         d.update(self.extra)
         return d
 
@@ -209,11 +215,23 @@ class MacaroonToken:
         max_gflops = float(raw_caveats.get("max_gflops", 0.0))
         locked_sats = int(raw_caveats.get("locked_sats", 0))
         worker_pk = raw_caveats.get("worker_pubkey")
+        task_ids_val = raw_caveats.get("task_ids")
+        task_ids = list(task_ids_val) if isinstance(task_ids_val, (list, tuple)) else None
+        job_id = str(raw_caveats["job_id"]) if "job_id" in raw_caveats and raw_caveats["job_id"] is not None else None
 
         extra = {
             k: v
             for k, v in raw_caveats.items()
-            if k not in ("task_id", "payment_hash", "expiry", "max_gflops", "locked_sats", "worker_pubkey")
+            if k not in (
+                "task_id",
+                "payment_hash",
+                "expiry",
+                "max_gflops",
+                "locked_sats",
+                "worker_pubkey",
+                "task_ids",
+                "job_id",
+            )
         }
 
         caveat_obj = MacaroonCaveats(
@@ -223,6 +241,8 @@ class MacaroonToken:
             max_gflops=max_gflops,
             locked_sats=locked_sats,
             worker_pubkey=worker_pk,
+            task_ids=task_ids,
+            job_id=job_id,
             extra=extra,
         )
 
@@ -286,8 +306,9 @@ class MacaroonToken:
         Returns (is_valid, error_message_or_none).
         """
         # 1. Task ID binding
-        if self.caveats.task_id != task_id:
-            return False, f"Caveat task_id mismatch: '{self.caveats.task_id}' != '{task_id}'"
+        allowed_tasks = self.caveats.task_ids or self.caveats.extra.get("task_ids") or ([self.caveats.task_id] if self.caveats.task_id else [])
+        if task_id not in allowed_tasks and self.caveats.task_id != task_id:
+            return False, f"Caveat task_id mismatch: '{task_id}' not authorized in batch {allowed_tasks}"
 
         # 2. Payment hash binding
         if expected_payment_hash is not None:
@@ -502,6 +523,58 @@ class MockSettlementBackend:
     def get_status(self, payment_hash: str) -> Optional[str]:
         return self.service.get_status(payment_hash)
 
+    def create_batch_escrow(
+        self,
+        task_ids: List[str],
+        total_compute_sats: int,
+        worker_lightning_address: str = "worker@node",
+        payment_hash: Optional[str] = None,
+        expiry_seconds: int = 3600,
+        max_gflops: float = 100.0,
+        job_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        if hasattr(self.service, "create_batch_escrow"):
+            return self.service.create_batch_escrow(
+                task_ids=task_ids,
+                total_compute_sats=total_compute_sats,
+                worker_lightning_address=worker_lightning_address,
+                payment_hash=payment_hash,
+                expiry_seconds=expiry_seconds,
+                max_gflops=max_gflops,
+                job_id=job_id,
+                **kwargs,
+            )
+        return self.service.create_hodl_invoice(
+            task_ids=task_ids,
+            total_compute_sats=total_compute_sats,
+            worker_lightning_address=worker_lightning_address,
+            payment_hash=payment_hash,
+            expiry_seconds=expiry_seconds,
+            max_gflops=max_gflops,
+            job_id=job_id,
+            **kwargs,
+        )
+
+    def settle_batch(self, job_id_or_hash: str, preimage: Optional[str] = None, **kwargs: Any) -> bool:
+        if hasattr(self.service, "settle_batch"):
+            return self.service.settle_batch(job_id_or_hash, preimage=preimage, **kwargs)
+        return self.service.settle_invoice(job_id_or_hash, preimage or "")
+
+    def cancel_batch(self, job_id_or_hash: str, **kwargs: Any) -> bool:
+        if hasattr(self.service, "cancel_batch"):
+            return self.service.cancel_batch(job_id_or_hash, **kwargs)
+        return self.service.cancel_invoice(job_id_or_hash)
+
+    def submit_fraud_dispute(
+        self, proof: Any, slash_amount_sats: Optional[int] = None, **kwargs: Any
+    ) -> Any:
+        if hasattr(self.service, "submit_fraud_dispute"):
+            return self.service.submit_fraud_dispute(
+                proof=proof, slash_amount_sats=slash_amount_sats, **kwargs
+            )
+        return None
+
 
 class HttpSettlementBackend:
     """HTTP REST settlement client for production settlement servers."""
@@ -539,7 +612,16 @@ class HttpSettlementBackend:
                     "max_gflops": max_gflops,
                     "expiry_seconds": expiry_seconds,
                 }
-                resp = client.post("/invoices/hodl", json=payload)
+                if "task_ids" in kwargs and kwargs["task_ids"]:
+                    payload["task_ids"] = kwargs["task_ids"]
+                if "job_id" in kwargs and kwargs["job_id"]:
+                    payload["job_id"] = kwargs["job_id"]
+                if "worker_pubkey" in kwargs and kwargs["worker_pubkey"]:
+                    payload["worker_pubkey"] = kwargs["worker_pubkey"]
+
+                resp = client.post("/invoices", json=payload)
+                if resp.status_code == 404:
+                    resp = client.post("/invoices/hodl", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -554,6 +636,31 @@ class HttpSettlementBackend:
                 return _HttpInvoiceResp()
         except Exception as ex:
             raise SettlementError(f"HTTP settlement create invoice failed: {ex}") from ex
+
+    def create_batch_escrow(
+        self,
+        task_ids: List[str],
+        total_compute_sats: int,
+        worker_lightning_address: str = "worker@node",
+        payment_hash: Optional[str] = None,
+        max_gflops: float = 100.0,
+        expiry_seconds: int = 3600,
+        job_id: Optional[str] = None,
+        worker_pubkey: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self.create_hodl_invoice(
+            task_id=task_ids[0] if task_ids else "",
+            total_compute_sats=total_compute_sats,
+            worker_lightning_address=worker_lightning_address,
+            payment_hash=payment_hash,
+            max_gflops=max_gflops,
+            expiry_seconds=expiry_seconds,
+            task_ids=task_ids,
+            job_id=job_id,
+            worker_pubkey=worker_pubkey,
+            **kwargs,
+        )
 
     def hold_invoice(self, payment_hash: str) -> bool:
         try:
@@ -575,6 +682,19 @@ class HttpSettlementBackend:
         except Exception as ex:
             raise SettlementError(f"HTTP settlement settle invoice failed: {ex}") from ex
 
+    def settle_batch(self, job_id_or_hash: str, preimage: Optional[str] = None, **kwargs: Any) -> bool:
+        try:
+            import httpx
+            with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
+                payload = {"job_id": job_id_or_hash, "preimage": preimage}
+                resp = client.post("/settle", json=payload)
+                if resp.status_code == 404:
+                    resp = client.post(f"/invoices/{job_id_or_hash}/settle", json={"preimage": preimage})
+                resp.raise_for_status()
+                return True
+        except Exception as ex:
+            raise SettlementError(f"HTTP settlement settle batch failed: {ex}") from ex
+
     def cancel_invoice(self, payment_hash: str) -> bool:
         try:
             import httpx
@@ -584,6 +704,35 @@ class HttpSettlementBackend:
                 return True
         except Exception as ex:
             raise SettlementError(f"HTTP settlement cancel invoice failed: {ex}") from ex
+
+    def cancel_batch(self, job_id_or_hash: str, **kwargs: Any) -> bool:
+        return self.cancel_invoice(job_id_or_hash)
+
+    def submit_fraud_dispute(
+        self,
+        proof: Any,
+        slash_amount_sats: Optional[int] = None,
+        consumer_signature: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            import httpx
+            proof_dict = (
+                proof.model_dump()
+                if hasattr(proof, "model_dump")
+                else (proof.dict() if hasattr(proof, "dict") else proof)
+            )
+            payload = {
+                "proof": proof_dict,
+                "slash_amount_sats": slash_amount_sats,
+                "consumer_signature": consumer_signature,
+            }
+            with httpx.Client(base_url=self.base_url, timeout=self.timeout) as client:
+                resp = client.post("/disputes/slash", json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as ex:
+            raise SettlementError(f"HTTP settlement submit fraud dispute failed: {ex}") from ex
 
     def get_status(self, payment_hash: str) -> Optional[str]:
         try:
@@ -671,6 +820,41 @@ class L402PaymentCoordinator:
             self.budget_controller.release(task_id)
             raise
 
+    def create_batch_escrow(
+        self,
+        worker_pubkey: str,
+        task_ids: List[str],
+        job_id: str,
+        total_sats: int,
+        worker_lightning_addr: str = "worker@node",
+        max_gflops: float = 100.0,
+        expiry_seconds: int = 3600,
+        preimage_hex: Optional[str] = None,
+    ) -> EscrowState:
+        """
+        1. Reserves cumulative budget in BudgetController for the job.
+        2. Creates batch escrow covering task_ids.
+        3. Locks escrow into HELD status.
+        4. Returns EscrowState.
+        """
+        self.budget_controller.reserve(job_id, total_sats)
+        try:
+            escrow = self.escrow_manager.create_batch_escrow(
+                worker_pubkey=worker_pubkey,
+                task_ids=task_ids,
+                job_id=job_id,
+                total_sats=total_sats,
+                worker_lightning_addr=worker_lightning_addr,
+                timeout_seconds=float(expiry_seconds),
+                max_gflops=max_gflops,
+                custom_preimage=preimage_hex,
+            )
+            self.escrow_manager.hold_escrow(escrow.payment_hash)
+            return escrow
+        except Exception:
+            self.budget_controller.release(job_id)
+            raise
+
     def format_auth_header(
         self,
         escrow_or_macaroon: Union[EscrowState, str],
@@ -710,6 +894,20 @@ class L402PaymentCoordinator:
         tid = escrow_or_task_id.task_id if isinstance(escrow_or_task_id, EscrowState) else str(escrow_or_task_id)
         self.escrow_manager.release_payout(tid)
         self.budget_controller.commit(tid)
+        return True
+
+    def settle_batch(self, escrow_or_job_id: Union[EscrowState, str], preimage: Optional[str] = None) -> bool:
+        """
+        Atomic settlement for an entire worker batch.
+        Commits budget in BudgetController.
+        """
+        job_id = (
+            (escrow_or_job_id.job_id or escrow_or_job_id.task_id)
+            if isinstance(escrow_or_job_id, EscrowState)
+            else str(escrow_or_job_id)
+        )
+        self.escrow_manager.settle_batch(job_id, preimage=preimage)
+        self.budget_controller.commit(job_id)
         return True
 
     def abort_and_refund(self, escrow_or_task_id: Union[EscrowState, str], reason: str = "") -> bool:

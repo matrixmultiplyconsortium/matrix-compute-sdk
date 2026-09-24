@@ -12,7 +12,7 @@ import math
 import secrets
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import grpc
 import numpy as np
@@ -127,6 +127,8 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         self.delay_seconds = 0.0
         self.bypass_l402 = False
         self.override_result_task_id: Optional[str] = None
+        self.tamper_task_ids: Set[str] = set()
+        self.tamper_on_task_count: Optional[int] = None
 
     def RequestTileTask(
         self,
@@ -239,9 +241,10 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         if not valid_hmac:
             return False, "Invalid macaroon HMAC signature", grpc.StatusCode.UNAUTHENTICATED
 
-        # 2. Caveat task_id
-        if caveats.get("task_id") != task_id:
-            return False, f"Caveat task_id mismatch: {caveats.get('task_id')} != {task_id}", grpc.StatusCode.PERMISSION_DENIED
+        # 2. Caveat task_id containment
+        allowed_tasks = caveats.get("task_ids") or [caveats.get("task_id")]
+        if task_id not in allowed_tasks:
+            return False, f"Caveat task_id mismatch: task '{task_id}' not in authorized batch {allowed_tasks}", grpc.StatusCode.PERMISSION_DENIED
 
         # 3. Caveat payment_hash
         if caveats.get("payment_hash") != payment_hash:
@@ -412,7 +415,13 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
             exec_time_ms = int((time.perf_counter() - start_time) * 1000)
 
             # Fault injection: tamper result
-            if self.tamper_result:
+            should_tamper = self.tamper_result
+            if self.tamper_task_ids and task_id in self.tamper_task_ids:
+                should_tamper = True
+            if self.tamper_on_task_count is not None and (self.task_count + 1) >= self.tamper_on_task_count:
+                should_tamper = True
+
+            if should_tamper:
                 matrix_c = matrix_c.copy()
                 matrix_c += self.tamper_perturbation
 
@@ -583,3 +592,9 @@ class MockWorkerNode:
 
     def set_override_result_task_id(self, task_id: Optional[str]) -> None:
         self.servicer.override_result_task_id = task_id
+
+    def set_tamper_task_ids(self, task_ids: Any) -> None:
+        self.servicer.tamper_task_ids = set(task_ids)
+
+    def set_tamper_on_task_count(self, count: Optional[int]) -> None:
+        self.servicer.tamper_on_task_count = count

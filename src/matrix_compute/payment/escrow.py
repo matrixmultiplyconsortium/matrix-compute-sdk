@@ -73,6 +73,23 @@ class SettlementBackendProtocol(Protocol):
 
     def get_status(self, payment_hash: str) -> Optional[str]: ...
 
+    def create_batch_escrow(
+        self,
+        task_ids: List[str],
+        total_compute_sats: int,
+        worker_lightning_address: str = "worker@node",
+        job_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any: ...
+
+    def settle_batch(self, job_id_or_hash: str, preimage: Optional[str] = None, **kwargs: Any) -> bool: ...
+
+    def cancel_batch(self, job_id_or_hash: str, **kwargs: Any) -> bool: ...
+
+    def submit_fraud_dispute(
+        self, proof: Any, slash_amount_sats: Optional[int] = None, **kwargs: Any
+    ) -> Any: ...
+
 
 # -----------------------------------------------------------------------------
 # Cryptographic Preimage & Payment Hash Utilities
@@ -137,7 +154,15 @@ class EscrowState:
     cancellation_reason: Optional[str] = None
     fraud_proof: Optional[Any] = None
     max_gflops: float = 100.0
+    task_ids: Optional[List[str]] = None
+    job_id: Optional[str] = None
+    worker_pubkey: Optional[str] = None
     _preimage: Optional[str] = field(default=None, repr=False)
+
+    @property
+    def is_batch(self) -> bool:
+        """True if this escrow represents an aggregate batch covering multiple tasks."""
+        return bool(self.task_ids and len(self.task_ids) > 1)
 
     @property
     def preimage(self) -> Optional[str]:
@@ -191,6 +216,10 @@ class EscrowState:
         """Serializes escrow state to dictionary with secret redaction by default."""
         data = {
             "task_id": self.task_id,
+            "task_ids": list(self.task_ids) if self.task_ids is not None else [self.task_id],
+            "job_id": self.job_id,
+            "worker_pubkey": self.worker_pubkey,
+            "is_batch": self.is_batch,
             "payment_hash": self.payment_hash,
             "status": self.status.value,
             "total_compute_sats": self.total_compute_sats,
@@ -246,15 +275,34 @@ class EscrowManager:
         self._lock = threading.RLock()
         self._escrows: Dict[str, EscrowState] = {}          # task_id -> EscrowState
         self._by_payment_hash: Dict[str, str] = {}         # payment_hash -> task_id
+        self._job_index: Dict[str, str] = {}               # job_id -> payment_hash
 
     def _resolve_escrow(self, task_id_or_hash: str) -> EscrowState:
-        """Resolves an escrow by either task_id or payment_hash under lock."""
-        clean = str(task_id_or_hash).strip().lower()
+        """Resolves an escrow by either task_id, payment_hash, or job_id under lock."""
+        clean = str(task_id_or_hash).strip()
+        clean_lower = clean.lower()
+        if clean in self._escrows:
+            return self._escrows[clean]
         if task_id_or_hash in self._escrows:
             return self._escrows[task_id_or_hash]
         if clean in self._by_payment_hash:
             tid = self._by_payment_hash[clean]
             return self._escrows[tid]
+        if clean_lower in self._by_payment_hash:
+            tid = self._by_payment_hash[clean_lower]
+            return self._escrows[tid]
+        if clean in self._job_index:
+            p_hash = self._job_index[clean]
+            if p_hash in self._by_payment_hash:
+                return self._escrows[self._by_payment_hash[p_hash]]
+            if p_hash in self._escrows:
+                return self._escrows[p_hash]
+        if clean_lower in self._job_index:
+            p_hash = self._job_index[clean_lower]
+            if p_hash in self._by_payment_hash:
+                return self._escrows[self._by_payment_hash[p_hash]]
+            if p_hash in self._escrows:
+                return self._escrows[p_hash]
         raise KeyError(f"Escrow not found for task ID or payment hash: '{task_id_or_hash}'")
 
     def create_escrow(
@@ -354,11 +402,147 @@ class EscrowManager:
                 created_at=now,
                 expires_at=expires_at,
                 max_gflops=max_gflops,
+                task_ids=[task_id],
                 _preimage=preimage_hex,
             )
 
             self._escrows[task_id] = escrow
             self._by_payment_hash[final_payment_hash] = task_id
+            return escrow
+
+    def create_batch_escrow(
+        self,
+        worker_pubkey: str,
+        task_ids: List[str],
+        job_id: str,
+        total_sats: int,
+        worker_lightning_addr: str = "worker@node",
+        timeout_seconds: Optional[float] = None,
+        payment_hash: Optional[str] = None,
+        max_gflops: float = 100.0,
+        custom_preimage: Optional[str] = None,
+    ) -> EscrowState:
+        """
+        Creates and registers an aggregate batch escrow covering multiple tasks assigned to a worker.
+        Validates non-empty unique task_ids, calls settlement backend to mint aggregate HODL invoice
+        and Macaroon, registers all constituent task_ids into _escrows, maps job_id into _job_index,
+        and maps payment_hash into _by_payment_hash.
+        """
+        if total_sats <= 0:
+            raise ValueError(f"total_sats must be positive integer, got {total_sats}")
+        if not task_ids:
+            raise ValueError("task_ids must be a non-empty list of task identifiers")
+        clean_task_ids = [str(t).strip() for t in task_ids if str(t).strip()]
+        if len(clean_task_ids) != len(task_ids):
+            raise ValueError("task_ids cannot contain empty identifiers")
+        if len(clean_task_ids) != len(set(clean_task_ids)):
+            raise ValueError(f"task_ids must contain unique identifiers, got duplicates: {task_ids}")
+
+        with self._lock:
+            for tid in clean_task_ids:
+                if tid in self._escrows:
+                    raise EscrowCreationError(
+                        f"Task ID '{tid}' already has an active or recorded escrow",
+                        task_id=tid,
+                    )
+
+            # Generate or validate secret preimage and payment hash
+            if custom_preimage is not None:
+                if not validate_preimage(custom_preimage, expected_payment_hash=payment_hash):
+                    raise PreimageVerificationError(
+                        "Invalid custom preimage or hash mismatch",
+                        payment_hash=payment_hash,
+                        task_id=clean_task_ids[0],
+                    )
+                preimage_hex = custom_preimage.strip().lower()
+                final_payment_hash = (
+                    payment_hash.strip().lower()
+                    if payment_hash
+                    else hashlib.sha256(bytes.fromhex(preimage_hex)).hexdigest().lower()
+                )
+            elif payment_hash is not None:
+                final_payment_hash = payment_hash.strip().lower()
+                preimage_hex = None
+            else:
+                preimage_hex, final_payment_hash = generate_escrow_secret()
+
+            if final_payment_hash in self._by_payment_hash:
+                raise EscrowCreationError(
+                    f"Payment hash '{final_payment_hash}' already exists in escrow registry",
+                    payment_hash=final_payment_hash,
+                    task_id=clean_task_ids[0],
+                )
+
+            timeout_sec = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
+            now = time.time()
+            expires_at = now + timeout_sec
+
+            try:
+                if hasattr(self.settlement_backend, "create_batch_escrow"):
+                    inv_resp = self.settlement_backend.create_batch_escrow(
+                        task_ids=clean_task_ids,
+                        total_compute_sats=total_sats,
+                        worker_lightning_address=worker_lightning_addr,
+                        payment_hash=final_payment_hash,
+                        expiry_seconds=int(timeout_sec),
+                        max_gflops=max_gflops,
+                        job_id=job_id,
+                        worker_pubkey=worker_pubkey,
+                    )
+                else:
+                    inv_resp = self.settlement_backend.create_hodl_invoice(
+                        task_id=clean_task_ids[0],
+                        task_ids=clean_task_ids,
+                        job_id=job_id,
+                        worker_pubkey=worker_pubkey,
+                        total_compute_sats=total_sats,
+                        worker_lightning_address=worker_lightning_addr,
+                        payment_hash=final_payment_hash,
+                        expiry_seconds=int(timeout_sec),
+                        max_gflops=max_gflops,
+                    )
+            except Exception as ex:
+                raise EscrowCreationError(
+                    f"Settlement backend failed to create batch escrow: {ex}",
+                    task_id=clean_task_ids[0],
+                    payment_hash=final_payment_hash,
+                    amount_sats=total_sats,
+                    cause=ex,
+                )
+
+            macaroon_str = getattr(inv_resp, "macaroon", "")
+            payment_req = getattr(inv_resp, "payment_request", "")
+            fee_sats = getattr(inv_resp, "platform_fee_sats", int(round(total_sats * 0.02)))
+            payout_sats = getattr(inv_resp, "worker_payout_sats", total_sats - fee_sats)
+
+            if preimage_hex is None and getattr(inv_resp, "preimage", None):
+                preimage_hex = getattr(inv_resp, "preimage")
+
+            escrow = EscrowState(
+                task_id=clean_task_ids[0],
+                task_ids=clean_task_ids,
+                job_id=job_id,
+                worker_pubkey=worker_pubkey,
+                payment_hash=final_payment_hash,
+                total_compute_sats=total_sats,
+                platform_fee_sats=fee_sats,
+                worker_payout_sats=payout_sats,
+                worker_lightning_address=worker_lightning_addr,
+                payment_request=payment_req,
+                macaroon=macaroon_str,
+                status=EscrowStatus.INITIALIZED,
+                created_at=now,
+                expires_at=expires_at,
+                max_gflops=max_gflops,
+                _preimage=preimage_hex,
+            )
+
+            for tid in clean_task_ids:
+                self._escrows[tid] = escrow
+            self._by_payment_hash[final_payment_hash] = clean_task_ids[0]
+            if job_id:
+                self._job_index[job_id] = final_payment_hash
+
             return escrow
 
     def hold_escrow(self, task_id_or_hash: str) -> EscrowState:
@@ -514,6 +698,123 @@ class EscrowManager:
             escrow.fraud_proof = fraud_proof
             return escrow
 
+    def settle_batch(self, job_id_or_hash: str, preimage: Optional[str] = None) -> EscrowState:
+        """
+        Settles an aggregate batch escrow via preimage disclosure.
+        Resolves via job_id, payment_hash, or task_id.
+        """
+        with self._lock:
+            escrow = self._resolve_escrow(job_id_or_hash)
+
+            if escrow.is_terminal:
+                raise EscrowStateError(
+                    f"Cannot settle batch escrow in terminal status '{escrow.status.value}'",
+                    task_id=escrow.task_id,
+                    current_status=escrow.status.value,
+                    attempted_transition="SETTLE",
+                )
+
+            if escrow.status != EscrowStatus.HELD:
+                raise EscrowStateError(
+                    f"Cannot settle batch escrow in status '{escrow.status.value}'; must be HELD",
+                    task_id=escrow.task_id,
+                    current_status=escrow.status.value,
+                    attempted_transition="SETTLE",
+                )
+
+            if escrow.is_expired():
+                self.cancel_batch(escrow.payment_hash, reason="expired_before_settlement")
+                raise EscrowTimeoutError(
+                    f"Batch escrow '{escrow.task_id}' expired before settlement could complete",
+                    task_id=escrow.task_id,
+                )
+
+            effective_preimage = preimage or escrow._preimage
+            if not effective_preimage:
+                raise SettlementError(
+                    f"Secret preimage missing for batch escrow '{escrow.job_id or escrow.task_id}'",
+                    task_id=escrow.task_id,
+                    payment_hash=escrow.payment_hash,
+                )
+
+            if hasattr(self.settlement_backend, "settle_batch"):
+                try:
+                    self.settlement_backend.settle_batch(escrow.job_id or escrow.payment_hash, effective_preimage)
+                except Exception as ex:
+                    raise SettlementError(
+                        f"Settlement backend rejected batch settlement: {ex}",
+                        task_id=escrow.task_id,
+                        payment_hash=escrow.payment_hash,
+                        cause=ex,
+                    )
+            else:
+                try:
+                    self.settlement_backend.settle_invoice(escrow.payment_hash, effective_preimage)
+                except Exception as ex:
+                    raise SettlementError(
+                        f"Settlement backend rejected settlement: {ex}",
+                        task_id=escrow.task_id,
+                        payment_hash=escrow.payment_hash,
+                        cause=ex,
+                    )
+
+            escrow.status = EscrowStatus.SETTLED
+            escrow.settled_at = time.time()
+            return escrow
+
+    def cancel_batch(
+        self,
+        job_id_or_hash: str,
+        reason: str = "batch_cancelled",
+        fraud_proof: Optional[Any] = None,
+    ) -> EscrowState:
+        """
+        Cancels a batch escrow and refunds locked satoshis.
+        Resolves via job_id, payment_hash, or task_id.
+        """
+        with self._lock:
+            escrow = self._resolve_escrow(job_id_or_hash)
+
+            if escrow.is_terminal:
+                raise EscrowStateError(
+                    f"Cannot cancel batch escrow in terminal status '{escrow.status.value}'",
+                    task_id=escrow.task_id,
+                    current_status=escrow.status.value,
+                    attempted_transition="CANCEL",
+                )
+
+            if hasattr(self.settlement_backend, "cancel_batch"):
+                try:
+                    self.settlement_backend.cancel_batch(escrow.job_id or escrow.payment_hash)
+                except Exception as ex:
+                    logger.warning("Settlement backend batch cancel error: %s", ex)
+            else:
+                try:
+                    self.settlement_backend.cancel_invoice(escrow.payment_hash)
+                except Exception as ex:
+                    logger.warning("Settlement backend invoice cancel error: %s", ex)
+
+            escrow.status = EscrowStatus.CANCELLED
+            escrow.cancelled_at = time.time()
+            escrow.cancellation_reason = reason
+            escrow.fraud_proof = fraud_proof
+            return escrow
+
+    def submit_fraud_dispute(
+        self,
+        proof: Any,
+        slash_amount_sats: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Submits a Freivalds fraud proof to the settlement backend to slash worker collateral."""
+        with self._lock:
+            if hasattr(self.settlement_backend, "submit_fraud_dispute"):
+                return self.settlement_backend.submit_fraud_dispute(
+                    proof=proof, slash_amount_sats=slash_amount_sats, **kwargs
+                )
+            logger.warning("Settlement backend does not implement submit_fraud_dispute")
+            return None
+
     def check_timeouts(self, now: Optional[float] = None) -> List[EscrowState]:
         """
         Sweeps active escrows and auto-cancels any exceeding their execution deadline.
@@ -523,7 +824,11 @@ class EscrowManager:
         expired_list: List[EscrowState] = []
 
         with self._lock:
+            seen_hashes = set()
             for escrow in self._escrows.values():
+                if escrow.payment_hash in seen_hashes:
+                    continue
+                seen_hashes.add(escrow.payment_hash)
                 if escrow.is_active and current >= escrow.expires_at:
                     try:
                         self.settlement_backend.cancel_invoice(escrow.payment_hash)

@@ -10,6 +10,7 @@ payout release or fraud slashing -> result accumulation & assembly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import collections
 import logging
 import math
 import time
@@ -151,125 +152,158 @@ class DistributedMatmulCoordinator:
         # 3. Result Assembler setup
         assembler = ResultAssembler.from_plan(grid_plan)
 
-        # 4. Process each tile task
-        worker_idx = 0
+        # 4. Pre-group scheduled tasks by assigned worker
         num_workers = len(workers)
+        worker_tasks: Dict[Any, List[TileTaskPlan]] = collections.defaultdict(list)
+        for idx, task_plan in enumerate(grid_plan.tasks):
+            assigned_worker = workers[idx % num_workers]
+            worker_tasks[assigned_worker].append(task_plan)
+
+        worker_escrows: Dict[Any, Any] = {}
         total_sats_spent = 0
 
-        for task_plan in grid_plan.tasks:
-            # Assign candidate worker (round-robin with full pool as fallback)
-            assigned_worker = workers[worker_idx % num_workers]
-            worker_idx += 1
+        # Provision 1 batch escrow per worker
+        for assigned_worker, tasks in worker_tasks.items():
             assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
-
-            candidates = [assigned_worker] + [
-                w for w in workers
-                if getattr(w, "worker_pubkey", getattr(w, "pubkey", "")) != assigned_pubkey
-            ]
-
             sats_per_gflop = getattr(assigned_worker, "sats_per_gflop", self.config.max_price_per_gflop)
-            gflops = task_plan.estimated_gflops
-            raw_sats = int(math.ceil(gflops * sats_per_gflop))
-            required_sats = max(raw_sats, 10)  # 10 sat minimum task floor
-            total_sats_spent += required_sats
+            total_sats = sum(max(int(math.ceil(t.estimated_gflops * sats_per_gflop)), 10) for t in tasks)
+            total_gflops = sum(t.estimated_gflops for t in tasks)
+            total_sats_spent += total_sats
 
-            # Escrow: Create & Hold
             worker_ln = getattr(
                 assigned_worker,
                 "lightning_routing_pubkey",
                 getattr(assigned_worker, "lightning_address", "worker@node"),
             )
+            task_ids = [t.task_id for t in tasks]
 
-            escrow = self.escrow_manager.create_escrow(
-                task_id=task_plan.task_id,
-                total_sats=required_sats,
-                worker_lightning_addr=worker_ln,
-                timeout_seconds=self.config.task_timeout_seconds,
-                max_gflops=max(gflops, 1.0),
-            )
+            if hasattr(self.escrow_manager, "create_batch_escrow"):
+                escrow = self.escrow_manager.create_batch_escrow(
+                    worker_pubkey=assigned_pubkey,
+                    task_ids=task_ids,
+                    job_id=job_id,
+                    total_sats=total_sats,
+                    worker_lightning_addr=worker_ln,
+                    timeout_seconds=self.config.task_timeout_seconds,
+                    max_gflops=max(total_gflops, 1.0),
+                )
+            else:
+                escrow = self.escrow_manager.create_escrow(
+                    task_id=task_ids[0],
+                    total_sats=total_sats,
+                    worker_lightning_addr=worker_ln,
+                    timeout_seconds=self.config.task_timeout_seconds,
+                    max_gflops=max(total_gflops, 1.0),
+                )
 
-            # Hold escrow
             if hasattr(self.escrow_manager, "hold_escrow"):
-                self.escrow_manager.hold_escrow(escrow.task_id)
+                self.escrow_manager.hold_escrow(escrow.payment_hash)
             elif hasattr(self.escrow_manager, "lock_escrow"):
                 self.escrow_manager.lock_escrow(escrow.payment_hash)
 
-            # Dispatch with failover
-            tile_c, raw_result = self.scheduler.execute_with_failover(
-                task_plan=task_plan,
-                candidate_workers=candidates,
-                macaroon=escrow.macaroon,
-                payment_hash=escrow.payment_hash,
-                dtype=dtype,
-            )
+            worker_escrows[assigned_worker] = escrow
 
-            # Freivalds Mathematical Verification
-            is_valid, discrepancy, dynamic_bound, proof_data = self.verifier.verify(
-                A=task_plan.a_tile,
-                B=task_plan.b_tile,
-                C=tile_c,
-                dtype=dtype,
-            )
+        # 5. Dispatch tiles and verify
+        for assigned_worker, tasks in worker_tasks.items():
+            escrow = worker_escrows[assigned_worker]
+            assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
+            candidates = [assigned_worker] + [
+                w for w in workers
+                if getattr(w, "worker_pubkey", getattr(w, "pubkey", "")) != assigned_pubkey
+            ]
 
-            if is_valid:
-                # Reveal preimage and settle payout
-                if hasattr(self.escrow_manager, "release_payout"):
-                    self.escrow_manager.release_payout(escrow.task_id)
-                elif hasattr(self.escrow_manager, "settle_escrow"):
-                    self.escrow_manager.settle_escrow(escrow.task_id)
-
-                # Accumulate tile product into final assembly buffer
-                assembler.accumulate(
-                    tile_result=tile_c,
-                    row_idx=task_plan.row_idx,
-                    col_idx=task_plan.col_idx,
-                    k_idx=task_plan.k_idx,
-                    row_slice=task_plan.row_slice,
-                    col_slice=task_plan.col_slice,
-                    task_id=task_plan.task_id,
-                )
-                manifest.completed_tasks += 1
-            else:
-                # Fraud detected! Withhold preimage, cancel escrow, and compile fraud proof
-                logger.error(
-                    "Fraud detected on tile task %s (discrepancy: %s > bound: %s)",
-                    task_plan.task_id,
-                    discrepancy,
-                    dynamic_bound,
-                )
-
-                worker_sig = getattr(raw_result, "worker_signature", "")
-                fraud_proof = FraudProofBuilder.build_fraud_proof(
-                    task_id=task_plan.task_id,
-                    worker_pubkey=assigned_pubkey,
-                    A=task_plan.a_tile,
-                    B=task_plan.b_tile,
-                    C=tile_c,
-                    proof_data=proof_data,
-                    worker_sig=worker_sig,
-                    consumer_privkey=self.signer.get_privkey_hex(),
+            for task_plan in tasks:
+                tile_c, raw_result = self.scheduler.execute_with_failover(
+                    task_plan=task_plan,
+                    candidate_workers=candidates,
+                    macaroon=escrow.macaroon,
+                    payment_hash=escrow.payment_hash,
                     dtype=dtype,
                 )
 
-                self.escrow_manager.abort_and_refund(
-                    task_id_or_hash=escrow.task_id,
-                    reason="freivalds_fraud_detected",
-                    fraud_proof=fraud_proof,
+                # Freivalds Mathematical Verification
+                is_valid, discrepancy, dynamic_bound, proof_data = self.verifier.verify(
+                    A=task_plan.a_tile,
+                    B=task_plan.b_tile,
+                    C=tile_c,
+                    dtype=dtype,
                 )
 
-                self.matchmaker.record_failure(assigned_pubkey)
+                if is_valid:
+                    assembler.accumulate(
+                        tile_result=tile_c,
+                        row_idx=task_plan.row_idx,
+                        col_idx=task_plan.col_idx,
+                        k_idx=task_plan.k_idx,
+                        row_slice=task_plan.row_slice,
+                        col_slice=task_plan.col_slice,
+                        task_id=task_plan.task_id,
+                    )
+                    manifest.completed_tasks += 1
+                else:
+                    # Fraud detected! Halt batch, cancel escrow, submit dispute, and raise error
+                    logger.error(
+                        "Fraud detected on tile task %s (discrepancy: %s > bound: %s)",
+                        task_plan.task_id,
+                        discrepancy,
+                        dynamic_bound,
+                    )
 
-                raise FraudDetectedError(
-                    f"Freivalds verification failed on tile task '{task_plan.task_id}': discrepancy {discrepancy} > bound {dynamic_bound}",
-                    task_id=task_plan.task_id,
-                    worker_pubkey=assigned_pubkey,
-                    discrepancy=discrepancy,
-                    fraud_proof=fraud_proof,
-                )
+                    worker_sig = getattr(raw_result, "worker_signature", "")
+                    fraud_proof = FraudProofBuilder.build_fraud_proof(
+                        task_id=task_plan.task_id,
+                        worker_pubkey=assigned_pubkey,
+                        A=task_plan.a_tile,
+                        B=task_plan.b_tile,
+                        C=tile_c,
+                        proof_data=proof_data,
+                        worker_sig=worker_sig,
+                        consumer_privkey=self.signer.get_privkey_hex(),
+                        dtype=dtype,
+                    )
+
+                    self.escrow_manager.abort_and_refund(
+                        task_id_or_hash=escrow.payment_hash,
+                        reason="freivalds_fraud_detected",
+                        fraud_proof=fraud_proof,
+                    )
+
+                    self._submit_fraud_slashing(fraud_proof)
+                    self.matchmaker.record_failure(assigned_pubkey)
+
+                    raise FraudDetectedError(
+                        f"Freivalds verification failed on tile task '{task_plan.task_id}': discrepancy {discrepancy} > bound {dynamic_bound}",
+                        task_id=task_plan.task_id,
+                        worker_pubkey=assigned_pubkey,
+                        discrepancy=discrepancy,
+                        fraud_proof=fraud_proof,
+                    )
+
+            # All tiles for this worker passed: release batch payout atomically
+            if hasattr(self.escrow_manager, "release_payout"):
+                self.escrow_manager.release_payout(escrow.payment_hash)
+            elif hasattr(self.escrow_manager, "settle_batch"):
+                self.escrow_manager.settle_batch(escrow.payment_hash)
+            elif hasattr(self.escrow_manager, "settle_escrow"):
+                self.escrow_manager.settle_escrow(escrow.payment_hash)
 
         manifest.total_cost_sats = total_sats_spent
         manifest.elapsed_time_sec = time.time() - start_time
         return assembler.get_result(enforce_complete=True)
+
+    def _submit_fraud_slashing(self, fraud_proof: Any) -> Any:
+        """Submits a Freivalds fraud proof to the settlement service to slash worker bond."""
+        try:
+            if hasattr(self.escrow_manager, "submit_fraud_dispute"):
+                res = self.escrow_manager.submit_fraud_dispute(fraud_proof)
+                if res is not None:
+                    return res
+            backend = getattr(self.escrow_manager, "settlement_backend", None)
+            if backend and hasattr(backend, "submit_fraud_dispute"):
+                return backend.submit_fraud_dispute(fraud_proof)
+        except Exception as ex:
+            logger.warning("Failed to submit fraud slashing dispute to settlement service: %s", ex)
+        return None
 
     matmul = execute_gemm
 
