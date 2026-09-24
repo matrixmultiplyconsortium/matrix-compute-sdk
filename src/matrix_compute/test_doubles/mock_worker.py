@@ -116,6 +116,7 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         self._task_metadata: Dict[str, Dict[str, Any]] = {}
         self.task_count = 0
         self.last_task_id: Optional[str] = None
+        self.execution_history: List[Dict[str, Any]] = []
 
         # Fault injection hooks
         self.tamper_result = False
@@ -283,6 +284,7 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         request_iterator: Iterator[pb2.TileDataChunk],
         context: Optional[grpc.ServicerContext] = None,
     ) -> pb2.TileResult:
+        start_time = time.perf_counter()
         if self.drop_connection:
             if context:
                 context.abort(grpc.StatusCode.UNAVAILABLE, "Connection dropped by worker")
@@ -401,7 +403,7 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
             matrix_a = np.frombuffer(b"".join(a_chunks), dtype=np_dtype).reshape((m, k))
             matrix_b = np.frombuffer(b"".join(b_chunks), dtype=np_dtype).reshape((k, n))
 
-            start_time = time.perf_counter()
+            compute_start = time.perf_counter()
             if dtype == "bf16":
                 # BF16 emulation: compute in FP32, mask mantissa
                 a_f32 = matrix_a.astype(np.float32)
@@ -412,7 +414,7 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
                 matrix_c = u32_masked.view(np.float32)
             else:
                 matrix_c = np.matmul(matrix_a, matrix_b)
-            exec_time_ms = int((time.perf_counter() - start_time) * 1000)
+            exec_time_ms = int((time.perf_counter() - compute_start) * 1000)
 
             # Fault injection: tamper result
             should_tamper = self.tamper_result
@@ -435,8 +437,14 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
                 payload_to_sign = f"{task_id}:{c_hash}".encode("utf-8")
                 sig = self.signer.sign_message(payload_to_sign)
 
+            end_time = time.perf_counter()
             with self._lock:
                 self.task_count += 1
+                self.execution_history.append({
+                    "task_id": task_id,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                })
 
             return pb2.TileResult(
                 task_id=self.override_result_task_id or task_id,
@@ -598,3 +606,14 @@ class MockWorkerNode:
 
     def set_tamper_on_task_count(self, count: Optional[int]) -> None:
         self.servicer.tamper_on_task_count = count
+
+    def get_execution_history(self) -> List[Dict[str, Any]]:
+        """Returns a copy of the servicer's task execution intervals."""
+        with self.servicer._lock:
+            return list(self.servicer.execution_history)
+
+    def clear_execution_history(self) -> None:
+        """Clears recorded execution history."""
+        with self.servicer._lock:
+            self.servicer.execution_history.clear()
+

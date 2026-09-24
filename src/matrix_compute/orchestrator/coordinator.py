@@ -9,6 +9,7 @@ payout release or fraud slashing -> result accumulation & assembly.
 
 from __future__ import annotations
 
+from concurrent import futures
 from dataclasses import dataclass, field
 import collections
 import logging
@@ -67,6 +68,19 @@ class JobManifest:
     total_cost_sats: int = 0
     elapsed_time_sec: float = 0.0
     task_ids: List[str] = field(default_factory=list)
+    peak_concurrency: int = 0
+
+
+@dataclass
+class PipelinedTaskContext:
+    """Context metadata for an in-flight pipelined tile task."""
+
+    worker_idx: int
+    task_plan: TileTaskPlan
+    assigned_worker: Any
+    candidates: List[Any]
+    escrow: Any
+    assigned_pubkey: str
 
 
 class DistributedMatmulCoordinator:
@@ -84,6 +98,7 @@ class DistributedMatmulCoordinator:
         scheduler: ParallelTaskScheduler,
         dispatcher: GrpcTaskDispatcher,
         mock_workers: Optional[List[MockWorkerNode]] = None,
+        max_concurrency: Optional[int] = None,
     ) -> None:
         self.config = config
         self.signer = signer
@@ -94,6 +109,12 @@ class DistributedMatmulCoordinator:
         self.dispatcher = dispatcher
         self.mock_workers = mock_workers or []
         self._last_manifest: Optional[JobManifest] = None
+        self.max_concurrency = (
+            max_concurrency
+            or getattr(self.config, "max_concurrency", None)
+            or getattr(self.scheduler, "max_concurrency", 16)
+        )
+        self._peak_in_flight: int = 0
 
         self.verifier = FreivaldsVerifier(
             k_rounds=self.config.freivalds_rounds,
@@ -206,96 +227,247 @@ class DistributedMatmulCoordinator:
 
             worker_group_escrows.append((assigned_worker, tasks, escrow))
 
-        # 5. Dispatch tiles and verify
-        for assigned_worker, tasks, escrow in worker_group_escrows:
+        # 5. Asynchronous 4-Stage Pipelined Sliding Window Execution
+        eff_concurrency = kwargs.get("max_concurrency", self.max_concurrency)
+        eff_concurrency = max(int(eff_concurrency), 1)
+        peak_concurrency: int = 0
+        first_fraud_error: Optional[FraudDetectedError] = None
+
+        # Build per-worker task queues and state
+        worker_queues: List[collections.deque[TileTaskPlan]] = []
+        worker_in_flight: List[int] = [0] * len(worker_group_escrows)
+        worker_verified: List[int] = [0] * len(worker_group_escrows)
+        worker_total_tasks: List[int] = []
+        worker_halted: List[bool] = [False] * len(worker_group_escrows)
+        worker_max_slots: List[int] = []
+        candidates_map: List[List[Any]] = []
+        escrow_map: List[Any] = []
+        pubkey_map: List[str] = []
+
+        for g_idx, (assigned_worker, tasks, escrow) in enumerate(worker_group_escrows):
             assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
+            pubkey_map.append(assigned_pubkey)
+            worker_queues.append(collections.deque(tasks))
+            worker_total_tasks.append(len(tasks))
+            slots = getattr(assigned_worker, "slots_available", 1)
+            worker_max_slots.append(max(int(slots), 1))
+            escrow_map.append(escrow)
             candidates = [assigned_worker] + [
                 w for w in workers
                 if getattr(w, "worker_pubkey", getattr(w, "pubkey", "")) != assigned_pubkey
             ]
+            candidates_map.append(candidates)
 
-            for task_plan in tasks:
-                tile_c, raw_result = self.scheduler.execute_with_failover(
-                    task_plan=task_plan,
-                    candidate_workers=candidates,
-                    macaroon=escrow.macaroon,
-                    payment_hash=escrow.payment_hash,
-                    dtype=dtype,
-                )
+        in_flight_futures: Dict[futures.Future, PipelinedTaskContext] = {}
 
-                # Freivalds Mathematical Verification
+        def _dispatch_ready() -> None:
+            nonlocal in_flight_futures, peak_concurrency
+            progress = True
+            while len(in_flight_futures) < eff_concurrency and progress:
+                progress = False
+                for i in range(len(worker_group_escrows)):
+                    if len(in_flight_futures) >= eff_concurrency:
+                        break
+                    if worker_halted[i]:
+                        continue
+                    if worker_in_flight[i] >= worker_max_slots[i]:
+                        continue
+                    if not worker_queues[i]:
+                        continue
+
+                    task_plan = worker_queues[i].popleft()
+                    worker_in_flight[i] += 1
+                    progress = True
+
+                    ctx = PipelinedTaskContext(
+                        worker_idx=i,
+                        task_plan=task_plan,
+                        assigned_worker=worker_group_escrows[i][0],
+                        candidates=candidates_map[i],
+                        escrow=escrow_map[i],
+                        assigned_pubkey=pubkey_map[i],
+                    )
+
+                    fut = self.scheduler.submit_tile(
+                        task_plan=task_plan,
+                        candidate_workers=ctx.candidates,
+                        macaroon=ctx.escrow.macaroon,
+                        payment_hash=ctx.escrow.payment_hash,
+                        dtype=dtype,
+                        timeout=self.config.task_timeout_seconds,
+                        escrow_manager=self.escrow_manager,
+                    )
+                    in_flight_futures[fut] = ctx
+                    peak_concurrency = max(peak_concurrency, len(in_flight_futures))
+                    self._peak_in_flight = max(self._peak_in_flight, peak_concurrency)
+
+        # Initial dispatch filling the sliding window up to eff_concurrency
+        _dispatch_ready()
+
+        # Sliding window processing loop
+        while in_flight_futures:
+            done, _ = futures.wait(in_flight_futures.keys(), return_when=futures.FIRST_COMPLETED)
+            for fut in done:
+                if fut not in in_flight_futures:
+                    continue
+                ctx = in_flight_futures.pop(fut)
+                i = ctx.worker_idx
+                worker_in_flight[i] -= 1
+
+                try:
+                    tile_c, raw_result = fut.result()
+                except Exception as ex:
+                    if first_fraud_error is not None:
+                        for pending_fut in list(in_flight_futures.keys()):
+                            pending_fut.cancel()
+                        in_flight_futures.clear()
+                        raise first_fraud_error
+                    # Abort all pending tasks
+                    for pending_fut in list(in_flight_futures.keys()):
+                        pending_fut.cancel()
+                    in_flight_futures.clear()
+                    for _, _, esc in worker_group_escrows:
+                        try:
+                            if hasattr(self.escrow_manager, "abort_and_refund"):
+                                self.escrow_manager.abort_and_refund(esc.payment_hash, reason=str(ex))
+                        except Exception:
+                            pass
+                    raise ex
+
+                # Stage 3: Freivalds Mathematical Verification
                 is_valid, discrepancy, dynamic_bound, proof_data = self.verifier.verify(
-                    A=task_plan.a_tile,
-                    B=task_plan.b_tile,
+                    A=ctx.task_plan.a_tile,
+                    B=ctx.task_plan.b_tile,
                     C=tile_c,
                     dtype=dtype,
                 )
 
                 if is_valid:
-                    assembler.accumulate(
-                        tile_result=tile_c,
-                        row_idx=task_plan.row_idx,
-                        col_idx=task_plan.col_idx,
-                        k_idx=task_plan.k_idx,
-                        row_slice=task_plan.row_slice,
-                        col_slice=task_plan.col_slice,
-                        task_id=task_plan.task_id,
-                    )
-                    manifest.completed_tasks += 1
+                    if not worker_halted[i]:
+                        # Stage 4: Result Assembly (thread-safe accumulation)
+                        assembler.accumulate(
+                            tile_result=tile_c,
+                            row_idx=ctx.task_plan.row_idx,
+                            col_idx=ctx.task_plan.col_idx,
+                            k_idx=ctx.task_plan.k_idx,
+                            row_slice=ctx.task_plan.row_slice,
+                            col_slice=ctx.task_plan.col_slice,
+                            task_id=ctx.task_plan.task_id,
+                        )
+                        manifest.completed_tasks += 1
+                        worker_verified[i] += 1
+                        del tile_c  # discard transient tile buffer immediately to enforce O(W * tile_size^2) memory
+
+                        # Batch Escrow Invariant:
+                        # Release payout ONLY when ALL tiles in this worker's batch have passed verification
+                        if worker_verified[i] == worker_total_tasks[i]:
+                            if hasattr(self.escrow_manager, "release_payout"):
+                                self.escrow_manager.release_payout(ctx.escrow.payment_hash)
+                            elif hasattr(self.escrow_manager, "settle_batch"):
+                                self.escrow_manager.settle_batch(ctx.escrow.payment_hash)
+                            elif hasattr(self.escrow_manager, "settle_escrow"):
+                                self.escrow_manager.settle_escrow(ctx.escrow.payment_hash)
+                    else:
+                        del tile_c
                 else:
-                    # Fraud detected! Halt batch, cancel escrow, submit dispute, and raise error
+                    # Fraud detected on worker i! Halt ONLY worker i, withhold payout, cancel escrow, slash bond
+                    worker_halted[i] = True
+                    worker_queues[i].clear()
+
+                    # Cancel ONLY worker i's pending in-flight futures if any
+                    cancelled_futs = [
+                        f for f, p_ctx in in_flight_futures.items()
+                        if p_ctx.worker_idx == i
+                    ]
+                    for f in cancelled_futs:
+                        f.cancel()
+                        del in_flight_futures[f]
+                        worker_in_flight[i] -= 1
+
                     logger.error(
                         "Fraud detected on tile task %s (discrepancy: %s > bound: %s)",
-                        task_plan.task_id,
+                        ctx.task_plan.task_id,
                         discrepancy,
                         dynamic_bound,
                     )
 
                     worker_sig = getattr(raw_result, "worker_signature", "")
                     fraud_proof = FraudProofBuilder.build_fraud_proof(
-                        task_id=task_plan.task_id,
-                        worker_pubkey=assigned_pubkey,
-                        A=task_plan.a_tile,
-                        B=task_plan.b_tile,
+                        task_id=ctx.task_plan.task_id,
+                        worker_pubkey=ctx.assigned_pubkey,
+                        A=ctx.task_plan.a_tile,
+                        B=ctx.task_plan.b_tile,
                         C=tile_c,
                         proof_data=proof_data,
                         worker_sig=worker_sig,
                         consumer_privkey=self.signer.get_privkey_hex(),
                         dtype=dtype,
                     )
+                    del tile_c
 
-                    self.escrow_manager.abort_and_refund(
-                        task_id_or_hash=escrow.payment_hash,
-                        reason="freivalds_fraud_detected",
-                        fraud_proof=fraud_proof,
-                    )
+                    # Cancel worker i's batch escrow
+                    cancelled = False
+                    if hasattr(self.escrow_manager, "abort_and_refund"):
+                        try:
+                            self.escrow_manager.abort_and_refund(
+                                task_id_or_hash=ctx.escrow.payment_hash,
+                                reason="freivalds_fraud_detected",
+                                fraud_proof=fraud_proof,
+                            )
+                            cancelled = True
+                        except Exception as esc_ex:
+                            logger.warning("Error aborting escrow %s: %s", ctx.escrow.payment_hash, esc_ex)
+                    if not cancelled and hasattr(self.escrow_manager, "cancel_batch"):
+                        try:
+                            self.escrow_manager.cancel_batch(
+                                job_id_or_hash=ctx.escrow.payment_hash,
+                                reason="freivalds_fraud_detected",
+                                fraud_proof=fraud_proof,
+                            )
+                            cancelled = True
+                        except Exception as esc_ex:
+                            logger.warning("Error cancelling batch escrow %s: %s", ctx.escrow.payment_hash, esc_ex)
+                    if not cancelled and hasattr(self.escrow_manager, "cancel_escrow"):
+                        try:
+                            self.escrow_manager.cancel_escrow(
+                                ctx.escrow.payment_hash,
+                                reason="freivalds_fraud_detected",
+                            )
+                            cancelled = True
+                        except Exception as esc_ex:
+                            logger.warning("Error cancelling escrow %s: %s", ctx.escrow.payment_hash, esc_ex)
 
                     self._submit_fraud_slashing(fraud_proof)
-                    self.matchmaker.record_failure(assigned_pubkey)
+                    self.matchmaker.record_failure(ctx.assigned_pubkey)
 
-                    raise FraudDetectedError(
-                        f"Freivalds verification failed on tile task '{task_plan.task_id}': discrepancy {discrepancy} > bound {dynamic_bound}",
-                        task_id=task_plan.task_id,
-                        worker_pubkey=assigned_pubkey,
-                        discrepancy=discrepancy,
-                        fraud_proof=fraud_proof,
-                    )
+                    if first_fraud_error is None:
+                        first_fraud_error = FraudDetectedError(
+                            f"Freivalds verification failed on tile task '{ctx.task_plan.task_id}': discrepancy {discrepancy} > bound {dynamic_bound}",
+                            task_id=ctx.task_plan.task_id,
+                            worker_pubkey=ctx.assigned_pubkey,
+                            discrepancy=discrepancy,
+                            fraud_proof=fraud_proof,
+                        )
 
-            # All tiles for this worker passed: release batch payout atomically
-            if hasattr(self.escrow_manager, "release_payout"):
-                self.escrow_manager.release_payout(escrow.payment_hash)
-            elif hasattr(self.escrow_manager, "settle_batch"):
-                self.escrow_manager.settle_batch(escrow.payment_hash)
-            elif hasattr(self.escrow_manager, "settle_escrow"):
-                self.escrow_manager.settle_escrow(escrow.payment_hash)
+            # Backpressure release: replenish sliding window with newly freed slots
+            _dispatch_ready()
 
+        manifest.peak_concurrency = peak_concurrency
         manifest.total_cost_sats = total_sats_spent
         manifest.elapsed_time_sec = time.time() - start_time
+        self._peak_in_flight = peak_concurrency
+
+        if first_fraud_error is not None:
+            raise first_fraud_error
+
         return assembler.get_result(enforce_complete=True)
 
     def _submit_fraud_slashing(self, fraud_proof: Any) -> Any:
         """Submits a Freivalds fraud proof to the settlement service to slash worker bond."""
         try:
+            fraud_service = getattr(self, "fraud_service", None)
+            if fraud_service and hasattr(fraud_service, "submit_fraud_dispute"):
+                return fraud_service.submit_fraud_dispute(fraud_proof)
             if hasattr(self.escrow_manager, "submit_fraud_dispute"):
                 res = self.escrow_manager.submit_fraud_dispute(fraud_proof)
                 if res is not None:
@@ -303,6 +475,10 @@ class DistributedMatmulCoordinator:
             backend = getattr(self.escrow_manager, "settlement_backend", None)
             if backend and hasattr(backend, "submit_fraud_dispute"):
                 return backend.submit_fraud_dispute(fraud_proof)
+            if backend and hasattr(backend, "settlement_service"):
+                svc = getattr(backend, "settlement_service")
+                if hasattr(svc, "submit_fraud_dispute"):
+                    return svc.submit_fraud_dispute(fraud_proof)
         except Exception as ex:
             logger.warning("Failed to submit fraud slashing dispute to settlement service: %s", ex)
         return None
@@ -312,6 +488,17 @@ class DistributedMatmulCoordinator:
     def get_last_manifest(self) -> Optional[JobManifest]:
         """Returns metadata manifest for the last executed distributed GEMM job."""
         return self._last_manifest
+
+    @property
+    def peak_in_flight(self) -> int:
+        """Peak in-flight concurrency observed across execution stages."""
+        if self._last_manifest is not None and getattr(self._last_manifest, "peak_concurrency", 0) > 0:
+            return self._last_manifest.peak_concurrency
+        return self._peak_in_flight
+
+    @peak_in_flight.setter
+    def peak_in_flight(self, val: int) -> None:
+        self._peak_in_flight = val
 
     def _discover_and_match_workers(self, required_slots: int = 1) -> List[Any]:
         """Discovers and ranks compute workers."""

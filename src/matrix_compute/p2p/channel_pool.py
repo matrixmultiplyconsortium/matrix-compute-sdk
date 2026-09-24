@@ -169,11 +169,12 @@ class ChannelPool:
         with self._lock:
             channel = self._channels.pop(target, None)
             self._stubs.pop(target, None)
-            if channel is not None:
-                try:
-                    channel.close()
-                except Exception as ex:
-                    logger.debug("Error closing evicted channel to %s: %s", target, ex)
+
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception as ex:
+                logger.debug("Error closing evicted channel to %s: %s", target, ex)
 
     def close(self) -> None:
         """Closes all cached channels and releases resources."""
