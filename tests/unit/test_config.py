@@ -151,3 +151,142 @@ def test_from_env_isolated_method():
     assert config.min_worker_vram_mb == 16384
     # Ensure environment was cleaned up
     assert "MATRIX_TASK_TIMEOUT" not in os.environ
+
+
+from matrix_compute import PartitioningStrategy, WorkloadType
+
+
+def test_default_config_partitioning_and_workload():
+    """Asserts production default values for new Milestone 1 partitioning fields."""
+    config = ClientConfig()
+    assert config.partitioning_strategy == PartitioningStrategy.BLOCK_3D
+    assert config.partitioning_strategy.value == "block_3d"
+    assert config.workload_type == WorkloadType.GEMM_ONE_SHOT
+    assert config.workload_type.value == "gemm_one_shot"
+    assert config.num_strips is None
+    assert config.lease_ttl_seconds == 3600
+    assert config.spot_check_probability == 0.05
+
+
+def test_partitioning_strategy_enum():
+    """Verifies PartitioningStrategy enum values and string subclass behavior."""
+    assert PartitioningStrategy.BLOCK_3D == "block_3d"
+    assert PartitioningStrategy.OUTER_PRODUCT_1D == "outer_product_1d"
+    assert PartitioningStrategy.OUTPUT_GRID_2D == "output_grid_2d"
+    assert isinstance(PartitioningStrategy.OUTER_PRODUCT_1D, str)
+
+
+def test_workload_type_enum():
+    """Verifies WorkloadType enum values and string subclass behavior."""
+    assert WorkloadType.GEMM_ONE_SHOT == "gemm_one_shot"
+    assert WorkloadType.ITERATIVE_POWER == "iterative_power"
+    assert WorkloadType.BATCH_STREAM == "batch_stream"
+    assert isinstance(WorkloadType.GEMM_ONE_SHOT, str)
+
+
+def test_case_insensitive_partitioning_strategy_parsing():
+    """Verifies case-insensitive parsing and alias resolution for partitioning strategies."""
+    cfg1 = ClientConfig(partitioning_strategy="OUTER_PRODUCT_1D")
+    assert cfg1.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+
+    cfg2 = ClientConfig(partitioning_strategy="outer_product_1d")
+    assert cfg2.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+
+    cfg3 = ClientConfig(partitioning_strategy="1d_outer_product")
+    assert cfg3.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+
+    cfg4 = ClientConfig(partitioning_strategy="outer_1d")
+    assert cfg4.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+
+    cfg5 = ClientConfig(partitioning_strategy="output_grid_2d")
+    assert cfg5.partitioning_strategy == PartitioningStrategy.OUTPUT_GRID_2D
+
+    cfg6 = ClientConfig(partitioning_strategy="block_3d")
+    assert cfg6.partitioning_strategy == PartitioningStrategy.BLOCK_3D
+
+
+def test_case_insensitive_workload_type_parsing():
+    """Verifies case-insensitive parsing and alias resolution for workload types."""
+    cfg1 = ClientConfig(workload_type="ITERATIVE_POWER")
+    assert cfg1.workload_type == WorkloadType.ITERATIVE_POWER
+
+    cfg2 = ClientConfig(workload_type="iterative_power")
+    assert cfg2.workload_type == WorkloadType.ITERATIVE_POWER
+
+    cfg3 = ClientConfig(workload_type="power")
+    assert cfg3.workload_type == WorkloadType.ITERATIVE_POWER
+
+    cfg4 = ClientConfig(workload_type="BATCH_STREAM")
+    assert cfg4.workload_type == WorkloadType.BATCH_STREAM
+
+    cfg5 = ClientConfig(workload_type="gemm_one_shot")
+    assert cfg5.workload_type == WorkloadType.GEMM_ONE_SHOT
+
+
+def test_partitioning_and_workload_validation_errors():
+    """Verifies validation errors for invalid enum strings and boundary bounds."""
+    # Invalid strategy string
+    with pytest.raises(ValidationError) as exc:
+        ClientConfig(partitioning_strategy="nonexistent_strategy")
+    assert "Invalid partitioning_strategy" in str(exc.value)
+
+    # Invalid workload type
+    with pytest.raises(ValidationError) as exc:
+        ClientConfig(workload_type="invalid_workload")
+    assert "Invalid workload_type" in str(exc.value)
+
+    # num_strips ge=1 violation
+    with pytest.raises(ValidationError):
+        ClientConfig(num_strips=0)
+
+    with pytest.raises(ValidationError):
+        ClientConfig(num_strips=-4)
+
+    # lease_ttl_seconds ge=1 violation
+    with pytest.raises(ValidationError):
+        ClientConfig(lease_ttl_seconds=0)
+
+    # spot_check_probability range [0.0, 1.0] violations
+    with pytest.raises(ValidationError):
+        ClientConfig(spot_check_probability=-0.01)
+
+    with pytest.raises(ValidationError):
+        ClientConfig(spot_check_probability=1.05)
+
+
+def test_environment_variable_override_new_fields(monkeypatch):
+    """Verifies that environment variables correctly override partitioning fields."""
+    monkeypatch.setenv("MATRIX_PARTITIONING_STRATEGY", "outer_product_1d")
+    monkeypatch.setenv("MATRIX_WORKLOAD_TYPE", "iterative_power")
+    monkeypatch.setenv("MATRIX_NUM_STRIPS", "8")
+    monkeypatch.setenv("MATRIX_LEASE_TTL_SECONDS", "7200")
+    monkeypatch.setenv("MATRIX_SPOT_CHECK_PROBABILITY", "0.20")
+
+    config = ClientConfig()
+    assert config.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+    assert config.workload_type == WorkloadType.ITERATIVE_POWER
+    assert config.num_strips == 8
+    assert config.lease_ttl_seconds == 7200
+    assert config.spot_check_probability == 0.20
+
+
+def test_environment_variable_fallback_aliases(monkeypatch):
+    """Verifies fallback environment variable names (e.g. PARTITIONING_STRATEGY, WORKLOAD_PROFILE)."""
+    monkeypatch.setenv("PARTITIONING_STRATEGY", "OUTER_1D")
+    monkeypatch.setenv("WORKLOAD_PROFILE", "batch_stream")
+    monkeypatch.setenv("NUM_STRIPS", "4")
+
+    config = ClientConfig()
+    assert config.partitioning_strategy == PartitioningStrategy.OUTER_PRODUCT_1D
+    assert config.workload_type == WorkloadType.BATCH_STREAM
+    assert config.num_strips == 4
+
+
+def test_public_api_exports():
+    """Verifies top-level exports from matrix_compute."""
+    import matrix_compute
+
+    assert hasattr(matrix_compute, "PartitioningStrategy")
+    assert hasattr(matrix_compute, "WorkloadType")
+    assert matrix_compute.PartitioningStrategy.BLOCK_3D == "block_3d"
+    assert matrix_compute.WorkloadType.GEMM_ONE_SHOT == "gemm_one_shot"

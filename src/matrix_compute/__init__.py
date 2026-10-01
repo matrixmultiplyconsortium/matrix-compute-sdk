@@ -4,7 +4,12 @@ orchestrator for distributed matrix multiplication over decentralized compute no
 """
 
 from .client import MatrixComputeClient, distributed_matmul
-from .config import ClientConfig, get_default_config
+from .config import (
+    ClientConfig,
+    PartitioningStrategy,
+    WorkloadType,
+    get_default_config,
+)
 from .crypto import (
     ClientSigner,
     generate_keypair,
@@ -126,6 +131,8 @@ __all__ = [
     "distributed_matmul",
     # Configuration
     "ClientConfig",
+    "PartitioningStrategy",
+    "WorkloadType",
     "get_default_config",
     # Base Exception
     "MatrixComputeError",

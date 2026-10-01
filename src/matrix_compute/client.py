@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from matrix_compute.config import ClientConfig, get_default_config
+from matrix_compute.config import ClientConfig, PartitioningStrategy, get_default_config
 from matrix_compute.crypto.signer import ClientSigner
 from matrix_compute.discovery.matchmaker import Matchmaker
 from matrix_compute.discovery.relay_client import RelayClient
@@ -197,6 +197,8 @@ class MatrixComputeClient:
         B: np.ndarray,
         dtype: Optional[str] = None,
         tile_size: Optional[int] = None,
+        partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
+        num_strips: Optional[int] = None,
         **kwargs: Any,
     ) -> np.ndarray:
         """
@@ -207,6 +209,8 @@ class MatrixComputeClient:
             B: 2D numpy array of shape (K, N).
             dtype: Target precision format ('fp32', 'fp16', 'bf16'). Defaults to config.dtype_preference.
             tile_size: Block size for matrix partitioning. Defaults to config.default_tile_size.
+            partitioning_strategy: Partitioning strategy (BLOCK_3D, OUTER_PRODUCT_1D). Defaults to config.
+            num_strips: Strip count for 1D outer product. Defaults to worker count or tile_size heuristic.
             **kwargs: Additional options passed to the coordinator.
 
         Returns:
@@ -263,6 +267,8 @@ class MatrixComputeClient:
             B=B,
             dtype=target_dtype,
             tile_size=eff_tile_size,
+            partitioning_strategy=partitioning_strategy,
+            num_strips=num_strips,
             **kwargs,
         )
 
@@ -318,6 +324,8 @@ def distributed_matmul(
     dtype: str = "fp32",
     config: Optional[ClientConfig] = None,
     tile_size: Optional[int] = None,
+    partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
+    num_strips: Optional[int] = None,
     **kwargs: Any,
 ) -> np.ndarray:
     """
@@ -325,8 +333,27 @@ def distributed_matmul(
 
     Instantiates a temporary MatrixComputeClient, computes C = A x B, and closes cleanly.
     """
-    with MatrixComputeClient(config=config, **kwargs) as client:
-        return client.matmul(A, B, dtype=dtype, tile_size=tile_size, **kwargs)
+    client_kwargs = dict(kwargs)
+    if partitioning_strategy is not None and "partitioning_strategy" not in client_kwargs:
+        client_kwargs["partitioning_strategy"] = partitioning_strategy
+    if num_strips is not None and "num_strips" not in client_kwargs:
+        client_kwargs["num_strips"] = num_strips
+
+    matmul_kwargs = {
+        k: v for k, v in kwargs.items()
+        if k not in ("partitioning_strategy", "num_strips")
+    }
+
+    with MatrixComputeClient(config=config, **client_kwargs) as client:
+        return client.matmul(
+            A=A,
+            B=B,
+            dtype=dtype,
+            tile_size=tile_size,
+            partitioning_strategy=partitioning_strategy,
+            num_strips=num_strips,
+            **matmul_kwargs,
+        )
 
 
 def main() -> None:

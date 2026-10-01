@@ -31,7 +31,7 @@ except ImportError:
     from matrix_contracts.schemas.verification import FreivaldsFraudProof
     from matrix_contracts.schemas.relay import WorkerQueryRequest
 
-from matrix_compute.config import ClientConfig
+from matrix_compute.config import ClientConfig, PartitioningStrategy
 from matrix_compute.crypto.signer import ClientSigner
 from matrix_compute.discovery.matchmaker import Matchmaker
 from matrix_compute.discovery.relay_client import DiscoveredWorker, RelayClient
@@ -109,6 +109,7 @@ class DistributedMatmulCoordinator:
         self.dispatcher = dispatcher
         self.mock_workers = mock_workers or []
         self._last_manifest: Optional[JobManifest] = None
+        self._last_assembler: Optional[ResultAssembler] = None
         self.max_concurrency = (
             max_concurrency
             or getattr(self.config, "max_concurrency", None)
@@ -129,6 +130,8 @@ class DistributedMatmulCoordinator:
         B: np.ndarray,
         dtype: str = "fp32",
         tile_size: int = 1024,
+        partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
+        num_strips: Optional[int] = None,
         **kwargs: Any,
     ) -> np.ndarray:
         """
@@ -138,14 +141,73 @@ class DistributedMatmulCoordinator:
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         m, k = A.shape
         _, n = B.shape
+        effective_tile_size = int(tile_size) if tile_size is not None else getattr(self.config, "default_tile_size", 1024)
 
-        # 1. Tiling plan
+        # 1. Resolve partitioning strategy
+        raw_strategy = (
+            partitioning_strategy
+            or kwargs.get("partitioning_strategy")
+            or kwargs.get("strategy")
+            or getattr(self.config, "partitioning_strategy", PartitioningStrategy.BLOCK_3D)
+        )
+        strat_val = raw_strategy.value if hasattr(raw_strategy, "value") else str(raw_strategy)
+        strat_norm = strat_val.lower().strip()
+
+        is_outer_1d = strat_norm in (
+            "outer_product_1d",
+            "outer_1d",
+            "1d_outer_product",
+            "outer_product",
+            "outerproduct1d",
+        )
+        is_output_2d = strat_norm in (
+            "output_grid_2d",
+            "output_grid",
+            "2d_output_grid",
+            "outputgrid2d",
+            "grid_2d",
+            "output_2d",
+        )
+        if is_output_2d:
+            raise NotImplementedError("OUTPUT_GRID_2D partitioning is planned for a future milestone")
+        if not is_outer_1d and strat_norm not in ("block_3d", "block", "3d", "3d_block", "block3d"):
+            raise ValueError(f"Unknown partitioning strategy: '{raw_strategy}'")
+
+        # 2. Resolve strip count (num_strips) precedence
+        resolved_num_strips: Optional[int] = None
+        if is_outer_1d:
+            if num_strips is not None:
+                resolved_num_strips = int(num_strips)
+            elif kwargs.get("num_strips") is not None:
+                resolved_num_strips = int(kwargs["num_strips"])
+            elif getattr(self.config, "num_strips", None) is not None:
+                resolved_num_strips = int(self.config.num_strips)
+            elif kwargs.get("candidate_workers") or kwargs.get("candidates"):
+                cands = kwargs.get("candidate_workers") or kwargs.get("candidates")
+                if cands and len(cands) > 0:
+                    resolved_num_strips = len(cands)
+            elif self.mock_workers and len(self.mock_workers) > 0:
+                resolved_num_strips = len(self.mock_workers)
+
+            if resolved_num_strips is None or resolved_num_strips < 1:
+                resolved_num_strips = max(1, math.ceil(k / int(effective_tile_size)))
+
+        # 3. Create tiling plan
+        tiler_kwargs = {
+            k_arg: v_arg
+            for k_arg, v_arg in kwargs.items()
+            if k_arg not in ("strategy", "partitioning_strategy", "num_strips", "job_id", "task_id_prefix", "tile_size", "dtype")
+        }
         grid_plan = MatrixTiler.create_plan(
             a=A,
             b=B,
-            tile_size=tile_size,
+            tile_size=effective_tile_size,
             dtype=dtype,
             task_id_prefix=job_id,
+            job_id=job_id,
+            strategy=raw_strategy,
+            num_strips=resolved_num_strips,
+            **tiler_kwargs,
         )
 
         manifest = JobManifest(
@@ -154,7 +216,7 @@ class DistributedMatmulCoordinator:
             k=k,
             n=n,
             dtype=dtype,
-            tile_size=tile_size,
+            tile_size=effective_tile_size,
             total_tasks=len(grid_plan.tasks),
             task_ids=[t.task_id for t in grid_plan.tasks],
         )
@@ -172,6 +234,7 @@ class DistributedMatmulCoordinator:
 
         # 3. Result Assembler setup
         assembler = ResultAssembler.from_plan(grid_plan)
+        self._last_assembler = assembler
 
         # 4. Pre-group scheduled tasks by assigned worker
         num_workers = len(workers)
@@ -357,6 +420,12 @@ class DistributedMatmulCoordinator:
                         manifest.completed_tasks += 1
                         worker_verified[i] += 1
                         del tile_c  # discard transient tile buffer immediately to enforce O(W * tile_size^2) memory
+                        raw_result = None
+                        if hasattr(fut, "_result"):
+                            try:
+                                fut._result = None
+                            except Exception:
+                                pass
 
                         # Batch Escrow Invariant:
                         # Release payout ONLY when ALL tiles in this worker's batch have passed verification
@@ -369,6 +438,12 @@ class DistributedMatmulCoordinator:
                                 self.escrow_manager.settle_escrow(ctx.escrow.payment_hash)
                     else:
                         del tile_c
+                        raw_result = None
+                        if hasattr(fut, "_result"):
+                            try:
+                                fut._result = None
+                            except Exception:
+                                pass
                 else:
                     # Fraud detected on worker i! Halt ONLY worker i, withhold payout, cancel escrow, slash bond
                     worker_halted[i] = True
@@ -404,6 +479,12 @@ class DistributedMatmulCoordinator:
                         dtype=dtype,
                     )
                     del tile_c
+                    raw_result = None
+                    if hasattr(fut, "_result"):
+                        try:
+                            fut._result = None
+                        except Exception:
+                            pass
 
                     # Cancel worker i's batch escrow
                     cancelled = False
@@ -460,7 +541,32 @@ class DistributedMatmulCoordinator:
         if first_fraud_error is not None:
             raise first_fraud_error
 
-        return assembler.get_result(enforce_complete=True)
+        final_c = assembler.get_result(enforce_complete=True)
+
+        # Stage 5: Dual-Tier Freivalds Verification (Tier 2: Assembled Product Verification)
+        # Validates A(Br) == Cr within Higham bound gamma_K ||A||_inf ||B||_inf
+        verify_assembled = kwargs.get("verify_assembled", True)
+        if verify_assembled:
+            is_assembled_valid, assembled_disc, assembled_bound, proof_data = self.verifier.verify(
+                A=A,
+                B=B,
+                C=final_c,
+                dtype=dtype,
+            )
+            if not is_assembled_valid:
+                logger.error(
+                    "Tier 2 Assembled Freivalds verification failed (discrepancy: %s > bound: %s)",
+                    assembled_disc,
+                    assembled_bound,
+                )
+                raise VerificationFailedError(
+                    f"Assembled Freivalds verification failed: discrepancy {assembled_disc} > bound {assembled_bound}",
+                    discrepancy=assembled_disc,
+                    bound=assembled_bound,
+                    proof_data=proof_data,
+                )
+
+        return final_c
 
     def _submit_fraud_slashing(self, fraud_proof: Any) -> Any:
         """Submits a Freivalds fraud proof to the settlement service to slash worker bond."""

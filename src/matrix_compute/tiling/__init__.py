@@ -16,6 +16,7 @@ from .partitioner import (
     MatrixTiler,
     TileGridPlan,
     TileTaskPlan,
+    compute_1d_strips,
 )
 from .assembler import (
     ResultAssembler,
@@ -37,6 +38,7 @@ __all__ = [
     "TileTaskPlan",
     "TileGridPlan",
     "MatrixTiler",
+    "compute_1d_strips",
     # Assembly
     "ResultAssembler",
 ]

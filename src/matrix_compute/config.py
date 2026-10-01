@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import json
 import os
 import secrets
@@ -11,6 +12,34 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+class PartitioningStrategy(str, Enum):
+    """
+    Mathematical matrix partitioning strategy for distributed matrix multiplication.
+
+    - BLOCK_3D: Standard 3D sub-block tiling along M, N, and K dimensions (baseline).
+    - OUTER_PRODUCT_1D: Slices only inner dimension K into strips (upload-optimal, 0% upload redundancy).
+    - OUTPUT_GRID_2D: Slices M and N into a 2D spatial grid with K unsliced (download-optimal, zero local reduction).
+    """
+
+    BLOCK_3D = "block_3d"
+    OUTER_PRODUCT_1D = "outer_product_1d"
+    OUTPUT_GRID_2D = "output_grid_2d"
+
+
+class WorkloadType(str, Enum):
+    """
+    Execution workload profile for matrix computations.
+
+    - GEMM_ONE_SHOT: Single stateless one-off matrix multiplication (C = A x B).
+    - ITERATIVE_POWER: Iterative computation where matrix A is pinned in remote VRAM across vector steps.
+    - BATCH_STREAM: Streaming continuous sequence of matrix multiply tasks.
+    """
+
+    GEMM_ONE_SHOT = "gemm_one_shot"
+    ITERATIVE_POWER = "iterative_power"
+    BATCH_STREAM = "batch_stream"
 
 
 class ClientConfig(BaseModel):
@@ -50,6 +79,32 @@ class ClientConfig(BaseModel):
     # Tiling & Mathematical Constraints
     default_tile_size: int = Field(1024, ge=1, description="Default square block dimension for tiling")
     dtype_preference: str = Field("fp32", description="Precision format: 'fp32', 'fp16', or 'bf16'")
+
+    # Partitioning & Workload Strategy
+    partitioning_strategy: PartitioningStrategy = Field(
+        default=PartitioningStrategy.BLOCK_3D,
+        description="Mathematical matrix partitioning strategy (BLOCK_3D, OUTER_PRODUCT_1D, OUTPUT_GRID_2D)",
+    )
+    workload_type: WorkloadType = Field(
+        default=WorkloadType.GEMM_ONE_SHOT,
+        description="Workload profile for compute execution (GEMM_ONE_SHOT, ITERATIVE_POWER, BATCH_STREAM)",
+    )
+    num_strips: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Explicit strip count for 1D outer-product partitioning; defaults to worker count or tile_size heuristic",
+    )
+    lease_ttl_seconds: int = Field(
+        default=3600,
+        ge=1,
+        description="Remote GPU VRAM session lease duration in seconds for stateful iterative workloads",
+    )
+    spot_check_probability: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Sampling probability for probabilistic Freivalds verification in iterative workloads",
+    )
 
     # Freivalds Mathematical Verification Parameters
     verification_tolerance: float = Field(
@@ -108,6 +163,31 @@ class ClientConfig(BaseModel):
             "retry_backoff_factor": ["MATRIX_RETRY_BACKOFF_FACTOR"],
             "default_tile_size": ["MATRIX_DEFAULT_TILE_SIZE", "TILE_SIZE"],
             "dtype_preference": ["MATRIX_DTYPE_PREFERENCE", "DTYPE_PREFERENCE"],
+            "partitioning_strategy": [
+                "MATRIX_PARTITIONING_STRATEGY",
+                "PARTITIONING_STRATEGY",
+                "MATRIX_PARTITION_STRATEGY",
+                "PARTITION_STRATEGY",
+            ],
+            "workload_type": [
+                "MATRIX_WORKLOAD_TYPE",
+                "WORKLOAD_TYPE",
+                "MATRIX_WORKLOAD_PROFILE",
+                "WORKLOAD_PROFILE",
+            ],
+            "num_strips": [
+                "MATRIX_NUM_STRIPS",
+                "NUM_STRIPS",
+                "MATRIX_STRIPS",
+            ],
+            "lease_ttl_seconds": [
+                "MATRIX_LEASE_TTL_SECONDS",
+                "LEASE_TTL_SECONDS",
+            ],
+            "spot_check_probability": [
+                "MATRIX_SPOT_CHECK_PROBABILITY",
+                "SPOT_CHECK_PROBABILITY",
+            ],
             "verification_tolerance": ["MATRIX_VERIFICATION_TOLERANCE", "VERIFICATION_TOLERANCE"],
             "use_dynamic_freivalds_bound": ["MATRIX_USE_DYNAMIC_FREIVALDS_BOUND"],
             "freivalds_rounds": ["MATRIX_FREIVALDS_ROUNDS", "FREIVALDS_ROUNDS"],
@@ -173,6 +253,76 @@ class ClientConfig(BaseModel):
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"settlement_api_url must be a valid http or https URL, got '{v}'")
         return cleaned
+
+    @field_validator("partitioning_strategy", mode="before")
+    @classmethod
+    def validate_partitioning_strategy(cls, v: Any) -> PartitioningStrategy:
+        """Parse partitioning strategy with case-insensitivity and alias support."""
+        if isinstance(v, PartitioningStrategy):
+            return v
+        if not isinstance(v, str):
+            raise ValueError(
+                f"partitioning_strategy must be a PartitioningStrategy or string, got {type(v).__name__}"
+            )
+        cleaned = v.strip().lower()
+        for member in PartitioningStrategy:
+            if cleaned == member.value.lower() or cleaned == member.name.lower():
+                return member
+
+        aliases = {
+            "outer_1d": PartitioningStrategy.OUTER_PRODUCT_1D,
+            "1d_outer_product": PartitioningStrategy.OUTER_PRODUCT_1D,
+            "outer_product": PartitioningStrategy.OUTER_PRODUCT_1D,
+            "outerproduct1d": PartitioningStrategy.OUTER_PRODUCT_1D,
+            "output_grid": PartitioningStrategy.OUTPUT_GRID_2D,
+            "2d_output_grid": PartitioningStrategy.OUTPUT_GRID_2D,
+            "outputgrid2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "grid_2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "3d_block": PartitioningStrategy.BLOCK_3D,
+            "block3d": PartitioningStrategy.BLOCK_3D,
+            "block": PartitioningStrategy.BLOCK_3D,
+        }
+        if cleaned in aliases:
+            return aliases[cleaned]
+
+        valid_options = [e.value for e in PartitioningStrategy]
+        raise ValueError(
+            f"Invalid partitioning_strategy '{v}'. Must be one of {valid_options}"
+        )
+
+    @field_validator("workload_type", mode="before")
+    @classmethod
+    def validate_workload_type(cls, v: Any) -> WorkloadType:
+        """Parse workload type with case-insensitivity and alias support."""
+        if isinstance(v, WorkloadType):
+            return v
+        if not isinstance(v, str):
+            raise ValueError(
+                f"workload_type must be a WorkloadType or string, got {type(v).__name__}"
+            )
+        cleaned = v.strip().lower()
+        for member in WorkloadType:
+            if cleaned == member.value.lower() or cleaned == member.name.lower():
+                return member
+
+        aliases = {
+            "gemm": WorkloadType.GEMM_ONE_SHOT,
+            "one_shot": WorkloadType.GEMM_ONE_SHOT,
+            "gemm_oneshot": WorkloadType.GEMM_ONE_SHOT,
+            "iterative": WorkloadType.ITERATIVE_POWER,
+            "power": WorkloadType.ITERATIVE_POWER,
+            "power_iteration": WorkloadType.ITERATIVE_POWER,
+            "batch": WorkloadType.BATCH_STREAM,
+            "stream": WorkloadType.BATCH_STREAM,
+            "streaming": WorkloadType.BATCH_STREAM,
+        }
+        if cleaned in aliases:
+            return aliases[cleaned]
+
+        valid_options = [e.value for e in WorkloadType]
+        raise ValueError(
+            f"Invalid workload_type '{v}'. Must be one of {valid_options}"
+        )
 
     @field_validator("dtype_preference")
     @classmethod
