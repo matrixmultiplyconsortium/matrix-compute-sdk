@@ -78,6 +78,16 @@ class ClientConfig(BaseModel):
     mock_settlement: bool = Field(False, description="Route escrow to in-memory MockSettlementService")
     mock_workers: bool = Field(False, description="Dispatch tasks to in-memory MockWorkerNode pool")
 
+    # Confidential Computing (TEE) & End-to-End Transport Encryption
+    require_confidential_compute: bool = Field(
+        True,
+        description="Enforce TEE hardware attestation verification and AES-256-GCM end-to-end transport encryption",
+    )
+    required_tee_type: Optional[str] = Field(
+        None,
+        description="Specific TEE architecture requirement (e.g. 'nvidia-cca', 'simulated-cca'). None accepts any valid TEE.",
+    )
+
     @model_validator(mode="before")
     @classmethod
     def populate_from_environment(cls, data: Any) -> Any:
@@ -109,6 +119,8 @@ class ClientConfig(BaseModel):
             "mock_relay": ["MATRIX_MOCK_RELAY"],
             "mock_settlement": ["MATRIX_MOCK_SETTLEMENT"],
             "mock_workers": ["MATRIX_MOCK_WORKERS"],
+            "require_confidential_compute": ["MATRIX_REQUIRE_CONFIDENTIAL_COMPUTE", "REQUIRE_CONFIDENTIAL_COMPUTE"],
+            "required_tee_type": ["MATRIX_REQUIRED_TEE_TYPE", "REQUIRED_TEE_TYPE"],
         }
 
         enriched = dict(data)
@@ -128,6 +140,7 @@ class ClientConfig(BaseModel):
             "mock_relay",
             "mock_settlement",
             "mock_workers",
+            "require_confidential_compute",
         ]
         for bf in bool_fields:
             if bf in enriched and isinstance(enriched[bf], str):
@@ -227,6 +240,7 @@ class ClientConfig(BaseModel):
             "mock_relay": True,
             "mock_settlement": True,
             "mock_workers": True,
+            "require_confidential_compute": kwargs.get("require_confidential_compute", False),
             "connect_timeout_seconds": 1.0,
             "task_timeout_seconds": 3.0,
             "max_retries": 1,

@@ -1,8 +1,11 @@
 """
 P2P gRPC Task Dispatcher for matrix-compute-sdk.
 
-Handles RequestTileTask pre-negotiation, ExecuteTileTask progressive chunk streaming,
+Handles RequestTileTask pre-negotiation, ephemeral X25519 ECDH handshake,
+hardware attestation evidence verification via AttestationVerifier,
+progressive AES-256-GCM encrypted chunk streaming, result decryption,
 L402 metadata formatting, and worker Secp256k1 signature validation.
+Supports clean unencrypted fallback when require_confidential_compute is False.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import math
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -23,8 +27,23 @@ except ImportError:
     from matrix_contracts.proto import compute_service_pb2 as pb2
     from matrix_contracts.proto import compute_service_pb2_grpc as pb2_grpc
 
+from matrix_compute.crypto.attestation_verifier import AttestationVerifier
+from matrix_compute.crypto.session import (
+    CryptoSessionError,
+    DecryptionError,
+    KeyExchangeError,
+    SecurityPolicyViolationError,
+    SessionContext,
+    decrypt_result,
+    derive_session_keys,
+    encrypt_chunk,
+    generate_challenger_nonce,
+    generate_ephemeral_keypair,
+)
 from matrix_compute.crypto.signer import sha256_digest, verify_signature, verify_tile_result_signature
 from matrix_compute.exceptions import (
+    AttestationError,
+    AttestationEvidenceMalformedError,
     DispatchError,
     StreamingError,
     TaskDispatchError,
@@ -57,6 +76,8 @@ class DispatchedTileResult:
 class GrpcTaskDispatcher:
     """
     Dispatches individual matrix tile computation tasks to worker nodes over gRPC.
+    Manages confidential computing handshakes, attestation verification,
+    AES-256-GCM chunk encryption, and result decryption.
     """
 
     def __init__(
@@ -66,12 +87,38 @@ class GrpcTaskDispatcher:
         connect_timeout: float = 5.0,
         task_timeout: float = 30.0,
         chunk_size_bytes: int = 1024 * 1024,
+        require_confidential_compute: Optional[bool] = None,
+        required_tee_type: Optional[str] = None,
+        attestation_verifier: Optional[AttestationVerifier] = None,
+        config: Optional[Any] = None,
     ) -> None:
         self.channel_pool = channel_pool or ChannelPool()
         self.consumer_pubkey = consumer_pubkey
         self.connect_timeout = connect_timeout
         self.task_timeout = task_timeout
         self.chunk_size_bytes = max(chunk_size_bytes, 1024)
+
+        # Resolve confidential compute settings from config or explicit arguments
+        if config is not None:
+            self.require_confidential_compute = (
+                config.require_confidential_compute
+                if require_confidential_compute is None
+                else require_confidential_compute
+            )
+            self.required_tee_type = (
+                config.required_tee_type
+                if required_tee_type is None
+                else required_tee_type
+            )
+        else:
+            self.require_confidential_compute = (
+                False if require_confidential_compute is None else require_confidential_compute
+            )
+            self.required_tee_type = required_tee_type
+
+        self.attestation_verifier = attestation_verifier
+        self._sessions: Dict[str, SessionContext] = {}
+        self._sessions_lock = threading.Lock()
 
     def request_tile_task(
         self,
@@ -86,19 +133,49 @@ class GrpcTaskDispatcher:
     ) -> pb2.TileTaskAck:
         """
         Step 1: Handshake negotiation via RequestTileTask.
-        Raises WorkerTaskRejectedError if the worker rejects the task.
+        If require_confidential_compute is True:
+          - Generates ephemeral X25519 keypair and challenger nonce.
+          - Sends key and nonce in TileTaskRequest.
+          - Validates worker attestation evidence fail-closed.
+          - Derives directional AES-256-GCM session keys.
         """
         target = parse_multiaddr(worker_or_target)
         stub = self.channel_pool.get_stub(target)
         norm_dtype = normalize_dtype(dtype)
 
-        req = pb2.TileTaskRequest(
-            task_id=task_id,
-            matrix_a_rows=int(m),
-            matrix_a_cols=int(k),
-            matrix_b_cols=int(n),
-            dtype=norm_dtype,
-        )
+        session_ctx: Optional[SessionContext] = None
+
+        if self.require_confidential_compute:
+            client_priv, client_pub = generate_ephemeral_keypair()
+            nonce = generate_challenger_nonce()
+            session_ctx = SessionContext(
+                task_id=task_id,
+                client_ephemeral_priv=client_priv,
+                client_ephemeral_pub_bytes=client_pub,
+                attestation_nonce=nonce,
+                is_confidential=True,
+                tee_type=self.required_tee_type,
+            )
+            req = pb2.TileTaskRequest(
+                task_id=task_id,
+                matrix_a_rows=int(m),
+                matrix_a_cols=int(k),
+                matrix_b_cols=int(n),
+                dtype=norm_dtype,
+                require_confidential_compute=True,
+                client_ephemeral_pubkey=client_pub,
+                attestation_nonce=nonce,
+                required_tee_type=self.required_tee_type or "",
+            )
+        else:
+            req = pb2.TileTaskRequest(
+                task_id=task_id,
+                matrix_a_rows=int(m),
+                matrix_a_cols=int(k),
+                matrix_b_cols=int(n),
+                dtype=norm_dtype,
+                require_confidential_compute=False,
+            )
 
         eff_timeout = timeout if timeout is not None else self.connect_timeout
         try:
@@ -115,7 +192,311 @@ class GrpcTaskDispatcher:
                 reason=rejection_msg,
             )
 
+        # Handle Confidential Computing session derivation
+        if self.require_confidential_compute and session_ctx is not None:
+            if not ack.worker_ephemeral_pubkey or len(ack.worker_ephemeral_pubkey) != 32:
+                raise KeyExchangeError(f"Worker did not provide 32-byte ephemeral public key for task '{task_id}'")
+
+            if not ack.attestation_evidence:
+                raise AttestationEvidenceMalformedError(f"Worker returned empty attestation evidence for task '{task_id}'")
+
+            # Verify hardware attestation evidence fail-closed
+            if self.attestation_verifier is None:
+                self.attestation_verifier = AttestationVerifier()
+
+            self.attestation_verifier.verify(
+                evidence=ack.attestation_evidence,
+                expected_nonce=session_ctx.attestation_nonce,
+                expected_client_pubkey=ack.worker_ephemeral_pubkey,
+                task_id=task_id,
+            )
+
+            # Derive directional session keys
+            assert session_ctx.client_ephemeral_priv is not None
+            keys = derive_session_keys(
+                secret_or_priv=session_ctx.client_ephemeral_priv,
+                nonce_c_or_pub=ack.worker_ephemeral_pubkey,
+                nonce_w_or_salt=session_ctx.attestation_nonce,
+            )
+            session_ctx.worker_ephemeral_pub_bytes = ack.worker_ephemeral_pubkey
+            session_ctx.k_c2w = keys.k_c2w
+            session_ctx.k_w2c = keys.k_w2c
+            session_ctx.tee_type = ack.tee_type
+
+        with self._sessions_lock:
+            self._sessions[task_id] = session_ctx or SessionContext(
+                task_id=task_id,
+                client_ephemeral_priv=None,
+                client_ephemeral_pub_bytes=b"",
+                attestation_nonce=b"",
+                is_confidential=False,
+            )
+
         return ack
+
+    def stream_tile_chunks(
+        self,
+        task_id: str,
+        matrix_a: np.ndarray,
+        matrix_b: np.ndarray,
+        dtype: str = "fp32",
+        session: Optional[SessionContext] = None,
+    ) -> Iterator[pb2.TileDataChunk]:
+        """
+        Yields serialized TileDataChunk instances.
+        Encrypts chunks using AES-256-GCM with fresh 12-byte IVs if session is confidential.
+        """
+        target_dtype = normalize_dtype(dtype)
+        np_dtype = get_numpy_dtype(target_dtype)
+
+        seq = 0
+        is_encrypted = (
+            session is not None
+            and session.is_confidential
+            and session.k_c2w is not None
+        )
+
+        # Stream Matrix A
+        a_bytes = np.ascontiguousarray(matrix_a, dtype=np_dtype).tobytes()
+        total_a = len(a_bytes)
+        step = self.chunk_size_bytes
+
+        if total_a == 0:
+            if is_encrypted and session is not None and session.k_c2w is not None:
+                ct, iv, tag = encrypt_chunk(
+                    key=session.k_c2w,
+                    plaintext=b"",
+                    task_id=task_id,
+                    sequence_number=seq,
+                    is_matrix_a=True,
+                    is_final_chunk=False,
+                )
+                yield pb2.TileDataChunk(
+                    task_id=task_id,
+                    chunk_bytes=ct,
+                    is_matrix_a=True,
+                    sequence_number=seq,
+                    is_final_chunk=False,
+                    is_encrypted=True,
+                    iv=iv,
+                    tag=tag,
+                )
+            else:
+                yield pb2.TileDataChunk(
+                    task_id=task_id,
+                    chunk_bytes=b"",
+                    is_matrix_a=True,
+                    sequence_number=seq,
+                    is_final_chunk=False,
+                    is_encrypted=False,
+                )
+            seq += 1
+        else:
+            for i in range(0, total_a, step):
+                chunk_slice = a_bytes[i : i + step]
+                if is_encrypted and session is not None and session.k_c2w is not None:
+                    ct, iv, tag = encrypt_chunk(
+                        key=session.k_c2w,
+                        plaintext=chunk_slice,
+                        task_id=task_id,
+                        sequence_number=seq,
+                        is_matrix_a=True,
+                        is_final_chunk=False,
+                    )
+                    yield pb2.TileDataChunk(
+                        task_id=task_id,
+                        chunk_bytes=ct,
+                        is_matrix_a=True,
+                        sequence_number=seq,
+                        is_final_chunk=False,
+                        is_encrypted=True,
+                        iv=iv,
+                        tag=tag,
+                    )
+                else:
+                    yield pb2.TileDataChunk(
+                        task_id=task_id,
+                        chunk_bytes=chunk_slice,
+                        is_matrix_a=True,
+                        sequence_number=seq,
+                        is_final_chunk=False,
+                        is_encrypted=False,
+                    )
+                seq += 1
+
+        # Stream Matrix B
+        b_bytes = np.ascontiguousarray(matrix_b, dtype=np_dtype).tobytes()
+        total_b = len(b_bytes)
+
+        if total_b == 0:
+            if is_encrypted and session is not None and session.k_c2w is not None:
+                ct, iv, tag = encrypt_chunk(
+                    key=session.k_c2w,
+                    plaintext=b"",
+                    task_id=task_id,
+                    sequence_number=seq,
+                    is_matrix_a=False,
+                    is_final_chunk=True,
+                )
+                yield pb2.TileDataChunk(
+                    task_id=task_id,
+                    chunk_bytes=ct,
+                    is_matrix_a=False,
+                    sequence_number=seq,
+                    is_final_chunk=True,
+                    is_encrypted=True,
+                    iv=iv,
+                    tag=tag,
+                )
+            else:
+                yield pb2.TileDataChunk(
+                    task_id=task_id,
+                    chunk_bytes=b"",
+                    is_matrix_a=False,
+                    sequence_number=seq,
+                    is_final_chunk=True,
+                    is_encrypted=False,
+                )
+            seq += 1
+        else:
+            total_b_chunks = math.ceil(total_b / step)
+            for idx, i in enumerate(range(0, total_b, step)):
+                chunk_slice = b_bytes[i : i + step]
+                is_final = (idx == total_b_chunks - 1)
+                if is_encrypted and session is not None and session.k_c2w is not None:
+                    ct, iv, tag = encrypt_chunk(
+                        key=session.k_c2w,
+                        plaintext=chunk_slice,
+                        task_id=task_id,
+                        sequence_number=seq,
+                        is_matrix_a=False,
+                        is_final_chunk=is_final,
+                    )
+                    yield pb2.TileDataChunk(
+                        task_id=task_id,
+                        chunk_bytes=ct,
+                        is_matrix_a=False,
+                        sequence_number=seq,
+                        is_final_chunk=is_final,
+                        is_encrypted=True,
+                        iv=iv,
+                        tag=tag,
+                    )
+                else:
+                    yield pb2.TileDataChunk(
+                        task_id=task_id,
+                        chunk_bytes=chunk_slice,
+                        is_matrix_a=False,
+                        sequence_number=seq,
+                        is_final_chunk=is_final,
+                        is_encrypted=False,
+                    )
+                seq += 1
+
+    def collect_tile_results(
+        self,
+        tile_result: pb2.TileResult,
+        task_id: str,
+        m: int,
+        n: int,
+        dtype: str = "fp32",
+        worker_pubkey: str = "",
+        matrix_a: Optional[np.ndarray] = None,
+        matrix_b: Optional[np.ndarray] = None,
+        session: Optional[SessionContext] = None,
+    ) -> Tuple[np.ndarray, pb2.TileResult]:
+        """
+        Validates, decrypts (if encrypted), and unpacks TileResult into NumPy matrix.
+        Performs Secp256k1 worker signature verification.
+        """
+        target_dtype = normalize_dtype(dtype)
+        np_dtype = get_numpy_dtype(target_dtype)
+        bytes_per_elem = get_bytes_per_element(target_dtype)
+
+        # Validate task_id matches expected task_id
+        if str(tile_result.task_id).strip() != str(task_id).strip():
+            raise TaskDispatchError(
+                f"Worker returned mismatched task_id: expected {task_id}, got {tile_result.task_id}",
+                task_id=task_id,
+                returned_task_id=tile_result.task_id,
+            )
+
+        # Validate dimensions
+        if tile_result.rows != m or tile_result.cols != n:
+            raise StreamingError(
+                f"Worker returned invalid dimensions: expected ({m}, {n}), got ({tile_result.rows}, {tile_result.cols})"
+            )
+
+        # Decrypt payload if confidential compute was negotiated or worker returned ciphertext
+        if self.require_confidential_compute:
+            if not tile_result.is_encrypted:
+                raise SecurityPolicyViolationError(
+                    f"Confidential computing was required for task '{task_id}', but worker returned unencrypted TileResult",
+                    task_id=task_id,
+                )
+            if session is None or not session.is_confidential or session.k_w2c is None:
+                raise DecryptionError(
+                    f"Encrypted TileResult received for task '{task_id}', but no valid session key was established",
+                    task_id=task_id,
+                )
+            decrypted_bytes = decrypt_result(
+                key=session.k_w2c,
+                ciphertext=tile_result.result_bytes,
+                iv=tile_result.iv,
+                tag=tile_result.tag,
+                task_id=task_id,
+                rows=tile_result.rows,
+                cols=tile_result.cols,
+            )
+        else:
+            if tile_result.is_encrypted:
+                if session is not None and session.k_w2c is not None:
+                    decrypted_bytes = decrypt_result(
+                        key=session.k_w2c,
+                        ciphertext=tile_result.result_bytes,
+                        iv=tile_result.iv,
+                        tag=tile_result.tag,
+                        task_id=task_id,
+                        rows=tile_result.rows,
+                        cols=tile_result.cols,
+                    )
+                else:
+                    raise DecryptionError(
+                        f"Unexpected encrypted TileResult for unencrypted task '{task_id}'",
+                        task_id=task_id,
+                    )
+            else:
+                decrypted_bytes = tile_result.result_bytes
+
+        # Validate decrypted byte count
+        expected_bytes = m * n * bytes_per_elem
+        if len(decrypted_bytes) != expected_bytes:
+            raise StreamingError(
+                f"Worker returned byte count {len(decrypted_bytes)} != expected {expected_bytes}"
+            )
+
+        # Cryptographic signature validation
+        if worker_pubkey:
+            sig_valid = self.verify_worker_signature(
+                worker_pubkey=worker_pubkey,
+                task_id=task_id,
+                result_bytes=decrypted_bytes,
+                worker_signature=tile_result.worker_signature,
+                matrix_a=matrix_a,
+                matrix_b=matrix_b,
+                dtype=target_dtype,
+                raw_wire_bytes=tile_result.result_bytes if tile_result.is_encrypted else None,
+            )
+            if not sig_valid:
+                raise WorkerSignatureError(
+                    f"Worker signature verification failed on tile task '{task_id}'",
+                    task_id=task_id,
+                    worker_pubkey=worker_pubkey,
+                    signature=tile_result.worker_signature,
+                )
+
+        c_matrix = np.frombuffer(decrypted_bytes, dtype=np_dtype).reshape((m, n))
+        return c_matrix, tile_result
 
     def stream_execute_tile(
         self,
@@ -134,64 +515,14 @@ class GrpcTaskDispatcher:
         target = parse_multiaddr(worker_or_target)
         stub = self.channel_pool.get_stub(target)
         target_dtype = normalize_dtype(dtype)
-        np_dtype = get_numpy_dtype(target_dtype)
-        bytes_per_elem = get_bytes_per_element(target_dtype)
 
         m, k = matrix_a.shape
         k2, n = matrix_b.shape
         if k != k2:
             raise ValueError(f"Inner dimension mismatch: {k} != {k2}")
 
-        def _chunk_generator() -> Iterator[pb2.TileDataChunk]:
-            seq = 0
-            # Stream Matrix A
-            a_bytes = np.ascontiguousarray(matrix_a, dtype=np_dtype).tobytes()
-            total_a = len(a_bytes)
-            if total_a == 0:
-                yield pb2.TileDataChunk(
-                    task_id=task_id,
-                    chunk_bytes=b"",
-                    is_matrix_a=True,
-                    sequence_number=seq,
-                    is_final_chunk=False,
-                )
-                seq += 1
-            else:
-                for i in range(0, total_a, self.chunk_size_bytes):
-                    chunk_slice = a_bytes[i : i + self.chunk_size_bytes]
-                    yield pb2.TileDataChunk(
-                        task_id=task_id,
-                        chunk_bytes=chunk_slice,
-                        is_matrix_a=True,
-                        sequence_number=seq,
-                        is_final_chunk=False,
-                    )
-                    seq += 1
-
-            # Stream Matrix B
-            b_bytes = np.ascontiguousarray(matrix_b, dtype=np_dtype).tobytes()
-            total_b = len(b_bytes)
-            if total_b == 0:
-                yield pb2.TileDataChunk(
-                    task_id=task_id,
-                    chunk_bytes=b"",
-                    is_matrix_a=False,
-                    sequence_number=seq,
-                    is_final_chunk=True,
-                )
-            else:
-                total_b_chunks = math.ceil(total_b / self.chunk_size_bytes)
-                for idx, i in enumerate(range(0, total_b, self.chunk_size_bytes)):
-                    chunk_slice = b_bytes[i : i + self.chunk_size_bytes]
-                    is_final = (idx == total_b_chunks - 1)
-                    yield pb2.TileDataChunk(
-                        task_id=task_id,
-                        chunk_bytes=chunk_slice,
-                        is_matrix_a=False,
-                        sequence_number=seq,
-                        is_final_chunk=is_final,
-                    )
-                    seq += 1
+        with self._sessions_lock:
+            session = self._sessions.get(task_id)
 
         metadata: List[Tuple[str, str]] = [("x-task-id", task_id)]
         if auth_header:
@@ -200,54 +531,33 @@ class GrpcTaskDispatcher:
         eff_timeout = timeout if timeout is not None else self.task_timeout
         try:
             tile_result = stub.ExecuteTileTask(
-                _chunk_generator(),
+                self.stream_tile_chunks(
+                    task_id=task_id,
+                    matrix_a=matrix_a,
+                    matrix_b=matrix_b,
+                    dtype=target_dtype,
+                    session=session,
+                ),
                 metadata=metadata,
                 timeout=eff_timeout,
             )
         except grpc.RpcError as rpc_err:
             self._handle_rpc_error(rpc_err, task_id, "ExecuteTileTask", worker_pubkey=worker_pubkey, multiaddr=target)
+        finally:
+            with self._sessions_lock:
+                self._sessions.pop(task_id, None)
 
-        # Validate task_id matches expected task_id
-        if str(tile_result.task_id).strip() != str(task_id).strip():
-            raise TaskDispatchError(
-                f"Worker returned mismatched task_id: expected {task_id}, got {tile_result.task_id}",
-                task_id=task_id,
-                returned_task_id=tile_result.task_id,
-            )
-
-        # Validate dimensions and byte counts
-        expected_bytes = m * n * bytes_per_elem
-        if tile_result.rows != m or tile_result.cols != n:
-            raise StreamingError(
-                f"Worker returned invalid dimensions: expected ({m}, {n}), got ({tile_result.rows}, {tile_result.cols})"
-            )
-
-        if len(tile_result.result_bytes) != expected_bytes:
-            raise StreamingError(
-                f"Worker returned byte count {len(tile_result.result_bytes)} != expected {expected_bytes}"
-            )
-
-        # Cryptographic signature validation
-        if worker_pubkey:
-            sig_valid = self.verify_worker_signature(
-                worker_pubkey=worker_pubkey,
-                task_id=task_id,
-                result_bytes=tile_result.result_bytes,
-                worker_signature=tile_result.worker_signature,
-                matrix_a=matrix_a,
-                matrix_b=matrix_b,
-                dtype=target_dtype,
-            )
-            if not sig_valid:
-                raise WorkerSignatureError(
-                    f"Worker signature verification failed on tile task '{task_id}'",
-                    task_id=task_id,
-                    worker_pubkey=worker_pubkey,
-                    signature=tile_result.worker_signature,
-                )
-
-        c_matrix = np.frombuffer(tile_result.result_bytes, dtype=np_dtype).reshape((m, n))
-        return c_matrix, tile_result
+        return self.collect_tile_results(
+            tile_result=tile_result,
+            task_id=task_id,
+            m=m,
+            n=n,
+            dtype=target_dtype,
+            worker_pubkey=worker_pubkey,
+            matrix_a=matrix_a,
+            matrix_b=matrix_b,
+            session=session,
+        )
 
     def execute_tile(
         self,
@@ -349,15 +659,16 @@ class GrpcTaskDispatcher:
         matrix_a: Optional[np.ndarray] = None,
         matrix_b: Optional[np.ndarray] = None,
         dtype: Optional[str] = None,
+        raw_wire_bytes: Optional[bytes] = None,
     ) -> bool:
         """
         Validates worker's Secp256k1 signature.
-        Checks canonical format f"{task_id}:{c_hash}", and falls back to composite hash format.
+        Checks canonical format f"{task_id}:{c_hash}", raw wire bytes, and fallback formats.
         """
         if not worker_pubkey or not worker_signature:
             return False
 
-        # Primary canonical signature check
+        # 1. Primary canonical signature check on plaintext result bytes
         if verify_tile_result_signature(
             worker_pubkey=worker_pubkey,
             task_id=task_id,
@@ -366,13 +677,27 @@ class GrpcTaskDispatcher:
         ):
             return True
 
-        # Check if signature was produced on the pre-hashed payload: sha256(f"{task_id}:{c_hash}")
+        # 2. Check if signature was produced on the pre-hashed payload: sha256(f"{task_id}:{c_hash}")
         c_hash = sha256_digest(result_bytes)
         payload = f"{str(task_id).strip()}:{c_hash.strip()}".encode("utf-8")
         if verify_signature(worker_pubkey, hashlib.sha256(payload).digest(), worker_signature):
             return True
 
-        # Fallback composite signature check
+        # 3. If raw wire bytes (ciphertext) provided, check signature over ciphertext
+        if raw_wire_bytes is not None:
+            if verify_tile_result_signature(
+                worker_pubkey=worker_pubkey,
+                task_id=task_id,
+                result_bytes=raw_wire_bytes,
+                signature_hex=worker_signature,
+            ):
+                return True
+            raw_hash = sha256_digest(raw_wire_bytes)
+            raw_payload = f"{str(task_id).strip()}:{raw_hash.strip()}".encode("utf-8")
+            if verify_signature(worker_pubkey, hashlib.sha256(raw_payload).digest(), worker_signature):
+                return True
+
+        # 4. Fallback composite signature check
         if matrix_a is not None and matrix_b is not None:
             try:
                 np_dtype = get_numpy_dtype(normalize_dtype(dtype or "fp32"))
@@ -444,3 +769,7 @@ class GrpcTaskDispatcher:
                 f"gRPC error during {stage} for task '{task_id}': {details}",
                 cause=rpc_err,
             )
+
+
+# Alias per PROJECT.md interface contract
+TileDispatcher = GrpcTaskDispatcher

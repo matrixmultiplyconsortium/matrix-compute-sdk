@@ -435,3 +435,120 @@ class FraudDetectedError(VerificationFailedError):
             cause=kwargs.get("cause"),
         )
         self.fraud_proof = fraud_proof
+
+
+# -----------------------------------------------------------------------------
+# Confidential Computing (TEE) & Hardware Attestation Errors (Milestone 2)
+# -----------------------------------------------------------------------------
+
+class AttestationError(MatrixComputeError):
+    """Base exception for all hardware attestation verification failures."""
+
+    def __init__(
+        self,
+        message: str,
+        provider: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        details = {"provider": provider, "task_id": task_id}
+        details.update(kwargs.get("details", {}))
+        super().__init__(message, details=details, cause=kwargs.get("cause"))
+        self.provider = provider
+        self.task_id = task_id
+
+
+class AttestationEvidenceMalformedError(AttestationError):
+    """Raised when attestation evidence format is invalid, missing required fields, or unparseable."""
+
+
+class AttestationCertificateError(AttestationError):
+    """Base exception for X.509 certificate decoding, syntax, or extension parsing errors."""
+
+
+class AttestationChainInvalidError(AttestationCertificateError):
+    """Raised when X.509 certificate chain is broken, issuer/subject mismatch, or intermediate CA violation."""
+
+
+class AttestationUntrustedRootError(AttestationCertificateError):
+    """Raised when the root of the certificate chain does not anchor to any trusted Root CA."""
+
+
+class AttestationExpiredError(AttestationError):
+    """Raised when a certificate in the chain is expired/not-yet-valid, or evidence timestamp is stale."""
+
+
+class AttestationRevokedError(AttestationCertificateError):
+    """Raised when a certificate in the chain matches a revoked serial number or CRL."""
+
+
+class AttestationSignatureError(AttestationError):
+    """Raised when cryptographic signature verification fails on a certificate or attestation token."""
+
+
+class AttestationNonceMismatchError(AttestationError):
+    """Raised when attestation claims nonce does not match consumer challenger nonce (replay attack detected)."""
+
+    def __init__(
+        self,
+        message: str = "Attestation token challenger nonce mismatch",
+        expected_nonce: Optional[str] = None,
+        actual_nonce: Optional[str] = None,
+        provider: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        details = {"expected_nonce": expected_nonce, "actual_nonce": actual_nonce}
+        details.update(kwargs.get("details", {}))
+        super().__init__(message, provider=provider, task_id=task_id, details=details, **kwargs)
+        self.expected_nonce = expected_nonce
+        self.actual_nonce = actual_nonce
+
+
+class AttestationBindingError(AttestationError):
+    """Raised when attestation token claims do not bind to the client's ephemeral public key (MITM detected)."""
+
+    def __init__(
+        self,
+        message: str = "Attestation token ephemeral public key binding mismatch",
+        expected_pubkey_hash: Optional[str] = None,
+        actual_pubkey_hash: Optional[str] = None,
+        provider: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        details = {
+            "expected_pubkey_hash": expected_pubkey_hash,
+            "actual_pubkey_hash": actual_pubkey_hash,
+        }
+        details.update(kwargs.get("details", {}))
+        super().__init__(message, provider=provider, task_id=task_id, details=details, **kwargs)
+        self.expected_pubkey_hash = expected_pubkey_hash
+        self.actual_pubkey_hash = actual_pubkey_hash
+
+
+class AttestationMeasurementMismatchError(AttestationError):
+    """Raised when hardware PCR or firmware measurement digests do not match Golden RIM values."""
+
+    def __init__(
+        self,
+        message: str = "Hardware measurement digest mismatch against Golden RIM",
+        mismatches: Optional[Dict[str, Dict[str, str]]] = None,
+        missing_claims: Optional[List[str]] = None,
+        provider: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        details = {
+            "mismatches": mismatches or {},
+            "missing_claims": missing_claims or [],
+        }
+        details.update(kwargs.get("details", {}))
+        super().__init__(message, provider=provider, task_id=task_id, details=details, **kwargs)
+        self.mismatches = mismatches or {}
+        self.missing_claims = missing_claims or []
+
+
+class AttestationProviderUnsupportedError(AttestationError):
+    """Raised when attestation evidence provider is unknown or unsupported."""
+
