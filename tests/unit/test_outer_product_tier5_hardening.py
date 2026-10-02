@@ -297,13 +297,49 @@ class TestTier5PartitionerHardening:
         b = np.ones((8, 8), dtype=np.float32)
         plan = MatrixTiler.create_plan_outer_product_1d(a, b, num_strips=2)
 
-        # Plan dictionary access
+        # Plan dictionary access across all primary keys
         assert plan["m"] == 8
+        assert plan["k"] == 8
+        assert plan["n"] == 8
+        assert plan["tile_size"] == 4
+        assert plan["dtype"] == "fp32"
+        assert plan["num_m_blocks"] == 1
         assert plan["num_k_blocks"] == 2
-        with pytest.raises(KeyError):
+        assert plan["num_n_blocks"] == 1
+        assert plan["total_tasks"] == 2
+        assert plan["total_gflops"] == plan.total_gflops
+        assert len(plan["tasks"]) == 2
+
+        # Plan dictionary aliases and strategy metadata (SCOPE.md contract)
+        assert plan["p"] == 2
+        assert plan["strategy"] == "outer_product_1d"
+
+        # Plan dictionary helper methods
+        assert plan.get("m") == 8
+        assert plan.get("p") == 2
+        assert plan.get("strategy") == "outer_product_1d"
+        assert plan.get("nonexistent_key", "default_val") == "default_val"
+        assert plan.get("nonexistent_key") is None
+        assert "m" in plan
+        assert "p" in plan
+        assert "strategy" in plan
+        assert "tasks" in plan
+        assert "nonexistent_key" not in plan
+
+        # Plan dictionary collection views
+        assert "m" in plan.keys()
+        assert "p" in plan.keys()
+        assert "strategy" in plan.keys()
+        assert len(plan.values()) == len(plan.keys())
+        assert len(plan.items()) == len(plan.keys())
+        assert dict(plan.items())["m"] == 8
+        assert dict(plan.items())["p"] == 2
+        assert dict(plan.items())["strategy"] == "outer_product_1d"
+
+        with pytest.raises(KeyError, match="TileGridPlan has no field 'nonexistent_key'"):
             _ = plan["nonexistent_key"]
 
-        # Plan task lookup
+        # Plan task coordinate lookup
         task_found = plan.get_task(row_idx=0, col_idx=0, k_idx=1)
         assert task_found is not None
         assert task_found.k_idx == 1
@@ -311,11 +347,27 @@ class TestTier5PartitionerHardening:
         task_missing = plan.get_task(row_idx=1, col_idx=0, k_idx=0)
         assert task_missing is None
 
-        # Task dictionary access
+        # Task dictionary access and methods
         task = plan.tasks[0]
         assert task["task_id"] == task.task_id
+        assert task["row_idx"] == 0
+        assert task["col_idx"] == 0
         assert task["k_idx"] == 0
-        with pytest.raises(KeyError):
+        assert task["row_slice"] == (0, 8)
+        assert task["col_slice"] == (0, 8)
+        assert task["k_slice"] == (0, 4)
+        assert np.array_equal(task["a_tile"], task.a_tile)
+        assert np.array_equal(task["b_tile"], task.b_tile)
+        assert task.get("k_idx") == 0
+        assert task.get("nonexistent_task_key", 999) == 999
+        assert "task_id" in task
+        assert "a_tile" in task
+        assert "nonexistent_task_key" not in task
+        assert "task_id" in task.keys()
+        assert len(task.values()) == len(task.keys())
+        assert dict(task.items())["task_id"] == task.task_id
+
+        with pytest.raises(KeyError, match="TileTaskPlan has no field 'nonexistent_task_key'"):
             _ = task["nonexistent_task_key"]
 
 

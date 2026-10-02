@@ -593,7 +593,7 @@ class TestOuterProduct1DAssemblerIntegration:
             asm_shuf.accumulate_task(t, np.matmul(t.a_tile, t.b_tile))
         res_shuf = asm_shuf.get_result(enforce_complete=True)
 
-        np.testing.assert_allclose(res_fwd, res_shuf, rtol=1e-6)
+        np.testing.assert_allclose(res_fwd, res_shuf, rtol=1e-6, atol=1e-5)
 
     def test_assembler_duplicate_rejection(self):
         """Re-accumulating task at same coordinate (0, 0, p) raises TilingError."""

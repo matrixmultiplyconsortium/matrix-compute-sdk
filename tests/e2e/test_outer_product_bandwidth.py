@@ -521,8 +521,8 @@ class TestBandwidthContrastBaseline:
 
         # 3D has >0.0 upload redundancy
         assert p_3d.redundancy_ratio == 1.0  # I=2, J=2 -> 1.0
-        # 3D has 0.0 download redundancy (download is minimal MN)
-        assert p_3d.download_redundancy_ratio == 0.0
+        # 3D with L=2 has download redundancy of (L - 1) = 1.0 (download is L * MN)
+        assert p_3d.download_redundancy_ratio == 1.0
 
 
 # ==============================================================================
@@ -796,28 +796,25 @@ class TestCoordinatorEndToEndBandwidth:
         worker1: MockWorkerNode = hermetic_coordinator_env["worker1"]
         worker2: MockWorkerNode = hermetic_coordinator_env["worker2"]
 
-        # Reset worker task counters and hook chunk stream accounting
+        import threading
+
+        # Reset worker task counters and hook chunk stream accounting on dispatcher
         worker1.servicer.task_count = 0
         worker2.servicer.task_count = 0
         total_wire_bytes_received = 0
+        wire_lock = threading.Lock()
 
-        orig_exec1 = worker1.servicer.ExecuteTileTask
-        orig_exec2 = worker2.servicer.ExecuteTileTask
+        orig_stream_chunks = coord.dispatcher.stream_tile_chunks
 
-        def make_wire_counter(orig_func):
-            def counting_execute(request_iterator, context=None):
-                nonlocal total_wire_bytes_received
-                def counting_stream():
-                    nonlocal total_wire_bytes_received
-                    for chunk in request_iterator:
-                        if chunk.chunk_bytes:
-                            total_wire_bytes_received += len(chunk.chunk_bytes)
-                        yield chunk
-                return orig_func(counting_stream(), context)
-            return counting_execute
+        def counting_stream_chunks(*args: Any, **kwargs: Any):
+            nonlocal total_wire_bytes_received
+            for chunk in orig_stream_chunks(*args, **kwargs):
+                if chunk.chunk_bytes:
+                    with wire_lock:
+                        total_wire_bytes_received += len(chunk.chunk_bytes)
+                yield chunk
 
-        worker1.servicer.ExecuteTileTask = make_wire_counter(orig_exec1)
-        worker2.servicer.ExecuteTileTask = make_wire_counter(orig_exec2)
+        coord.dispatcher.stream_tile_chunks = counting_stream_chunks
 
         try:
             m, k, n = 20, 40, 20
@@ -848,8 +845,7 @@ class TestCoordinatorEndToEndBandwidth:
             expected = np.matmul(a, b)
             np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
         finally:
-            worker1.servicer.ExecuteTileTask = orig_exec1
-            worker2.servicer.ExecuteTileTask = orig_exec2
+            coord.dispatcher.stream_tile_chunks = orig_stream_chunks
 
 
 # ==============================================================================

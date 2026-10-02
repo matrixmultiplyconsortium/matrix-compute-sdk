@@ -112,6 +112,19 @@ class TileGridPlan:
     total_tasks: int
     total_gflops: float
     tasks: List[TileTaskPlan]
+    strategy: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.strategy is None:
+            if self.num_m_blocks == 1 and self.num_n_blocks == 1:
+                self.strategy = "outer_product_1d"
+            else:
+                self.strategy = "block_3d"
+
+    @property
+    def p(self) -> int:
+        """Alias for num_k_blocks (the number of strips / partitions along dimension K)."""
+        return self.num_k_blocks
 
     def iter_tasks(self) -> Iterator[TileTaskPlan]:
         return iter(self.tasks)
@@ -121,6 +134,42 @@ class TileGridPlan:
             if t.row_idx == row_idx and t.col_idx == col_idx and t.k_idx == k_idx:
                 return t
         return None
+
+    # Dictionary emulation for backwards and reference compatibility
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(f"TileGridPlan has no field '{key}'")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def keys(self) -> List[str]:
+        return [
+            "m",
+            "k",
+            "n",
+            "tile_size",
+            "dtype",
+            "num_m_blocks",
+            "num_k_blocks",
+            "num_n_blocks",
+            "total_tasks",
+            "total_gflops",
+            "tasks",
+            "strategy",
+            "p",
+        ]
+
+    def values(self) -> List[Any]:
+        return [getattr(self, k) for k in self.keys()]
+
+    def items(self) -> List[Tuple[str, Any]]:
+        return [(k, getattr(self, k)) for k in self.keys()]
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
 
 
 def compute_1d_strips(k: int, p: int) -> List[Tuple[int, int]]:
@@ -285,6 +334,7 @@ class MatrixTiler:
             total_tasks=p_effective,
             total_gflops=total_gflops,
             tasks=tasks,
+            strategy="outer_product_1d",
         )
 
     @classmethod
@@ -506,4 +556,5 @@ class MatrixTiler:
             total_tasks=len(tasks),
             total_gflops=total_gflops,
             tasks=tasks,
+            strategy="block_3d",
         )

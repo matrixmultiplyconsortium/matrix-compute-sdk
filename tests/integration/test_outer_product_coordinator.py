@@ -99,7 +99,11 @@ def hermetic_env() -> Generator[Dict[str, Any], None, None]:
     )
 
     signer = ClientSigner()
-    relay_client = RelayClient(relay_urls=["ws://127.0.0.1:8008"], in_memory_relay=relay)
+    relay_client = RelayClient(
+        relay_urls=["ws://127.0.0.1:8008"],
+        in_memory_relay=relay,
+        offline_mock_mode=True,
+    )
     matchmaker = Matchmaker()
     backend = MockSettlementBackend(settlement)
     escrow_mgr = EscrowManager(settlement_backend=backend, verification_key=vk)
@@ -251,6 +255,7 @@ class TestNumStripsPrecedenceHierarchy:
         coord.config.num_strips = None
         orig_mock_workers = coord.mock_workers
         coord.mock_workers = []
+        coord.relay_client.offline_mock_mode = True
         try:
             np.random.seed(204)
             a = np.random.randn(16, 48).astype(np.float32)
@@ -606,7 +611,8 @@ class TestZeroRegressions:
     """Validates baseline 3D block execution still functions correctly."""
 
     def test_baseline_3d_block_continues_working(self):
-        with MatrixComputeClient() as client:
+        config = ClientConfig.for_testing(default_tile_size=16)
+        with MatrixComputeClient(config=config) as client:
             np.random.seed(901)
             a = np.random.randn(32, 32).astype(np.float32)
             b = np.random.randn(32, 32).astype(np.float32)
