@@ -47,6 +47,7 @@ class BandwidthProfile:
     download_elements: int = 0
     optimal_download_elements: int = 0
     download_redundancy_ratio: float = 0.0
+    is_download_optimal: bool = False
 
     # Backwards compatibility alias
     @property
@@ -85,6 +86,7 @@ class BandwidthProfile:
             "download_elements",
             "optimal_download_elements",
             "download_redundancy_ratio",
+            "is_download_optimal",
         ]
 
     def items(self) -> List[Tuple[str, Any]]:
@@ -107,7 +109,16 @@ class BandwidthProfiler:
         m, k, n = plan.m, plan.k, plan.n
         dtype = plan.dtype
         tasks = plan.tasks
-        strat = strategy or ("outer_product_1d" if plan.num_m_blocks == 1 and plan.num_n_blocks == 1 else "block_3d")
+        if strategy is not None:
+            strat = strategy
+        elif plan.strategy is not None:
+            strat = plan.strategy
+        elif plan.num_m_blocks == 1 and plan.num_n_blocks == 1:
+            strat = "outer_product_1d"
+        elif plan.num_k_blocks == 1:
+            strat = "output_grid_2d"
+        else:
+            strat = "block_3d"
         return cls.profile_tasks(tasks, m=m, k=k, n=n, dtype=dtype, strategy=strat)
 
     @classmethod
@@ -188,6 +199,7 @@ class BandwidthProfiler:
         )
 
         is_upload_optimal = (redundancy_elements == 0) and (abs(redundancy_ratio) < 1e-12)
+        is_download_optimal = (download_elements == optimal_download) and (abs(download_redundancy_ratio) < 1e-12)
 
         return BandwidthProfile(
             m=m,
@@ -210,6 +222,7 @@ class BandwidthProfiler:
             download_elements=download_elements,
             optimal_download_elements=optimal_download,
             download_redundancy_ratio=download_redundancy_ratio,
+            is_download_optimal=is_download_optimal,
         )
 
     @classmethod
@@ -225,6 +238,106 @@ class BandwidthProfiler:
         """
         plan = MatrixTiler.create_plan_outer_product_1d(a, b, num_strips=num_strips, dtype=dtype)
         return cls.profile_plan(plan, strategy="outer_product_1d")
+
+    @classmethod
+    def profile_output_grid_2d(
+        cls,
+        a: np.ndarray,
+        b: np.ndarray,
+        grid_rows: Optional[int] = None,
+        grid_cols: Optional[int] = None,
+        grid_shape: Optional[Tuple[int, int]] = None,
+        p_r: Optional[int] = None,
+        p_c: Optional[int] = None,
+        tile_size: Optional[int] = None,
+        dtype: str = "fp32",
+    ) -> BandwidthProfile:
+        """
+        Profiles a 2D Output Grid plan directly from matrices A and B.
+        """
+        plan = MatrixTiler.create_plan_output_grid_2d(
+            a=a,
+            b=b,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            grid_shape=grid_shape,
+            p_r=p_r,
+            p_c=p_c,
+            tile_size=tile_size,
+            dtype=dtype,
+        )
+        return cls.profile_plan(plan, strategy="output_grid_2d")
+
+    @classmethod
+    def theoretical_2d_output_grid_bandwidth(
+        cls,
+        m: int,
+        n: int,
+        k: int,
+        p_r: int = 1,
+        p_c: int = 1,
+        itemsize: Optional[int] = None,
+        dtype: str = "fp32",
+        **kwargs: Any,
+    ) -> BandwidthProfile:
+        """
+        Calculates theoretical bandwidth metrics for 2D Output Grid partitioning.
+        Formula:
+        Total tasks: P_r * P_c
+        Upload volume: P_c * M * K + P_r * K * N
+        Download volume: M * N (zero download redundancy, optimal theoretical bound)
+        """
+        eff_m = int(kwargs.get("m", m))
+        eff_n = int(kwargs.get("n", n))
+        eff_k = int(kwargs.get("k", k))
+        eff_pr = int(kwargs.get("p_r", kwargs.get("grid_rows", p_r)))
+        eff_pc = int(kwargs.get("p_c", kwargs.get("grid_cols", p_c)))
+
+        norm_dtype = normalize_dtype(dtype)
+        bytes_per_elem = itemsize if itemsize is not None else get_bytes_per_element(norm_dtype)
+
+        optimal_elements = eff_m * eff_k + eff_k * eff_n
+        total_a = eff_pc * (eff_m * eff_k)
+        total_b = eff_pr * (eff_k * eff_n)
+        total_uploaded = total_a + total_b
+
+        redundancy_elements = total_uploaded - optimal_elements
+        redundancy_ratio = (
+            (float(total_uploaded) / float(optimal_elements)) - 1.0
+            if optimal_elements > 0
+            else 0.0
+        )
+
+        optimal_download = eff_m * eff_n
+        download_elements = eff_m * eff_n
+        download_redundancy_ratio = 0.0
+
+        is_upload_optimal = (eff_pr == 1 and eff_pc == 1)
+        is_download_optimal = True
+
+        return BandwidthProfile(
+            m=eff_m,
+            k=eff_k,
+            n=eff_n,
+            num_tasks=eff_pr * eff_pc,
+            strategy="output_grid_2d",
+            dtype=norm_dtype,
+            total_a_elements=total_a,
+            total_b_elements=total_b,
+            total_uploaded_elements=total_uploaded,
+            optimal_elements=optimal_elements,
+            redundancy_elements=redundancy_elements,
+            redundancy_ratio=redundancy_ratio,
+            bytes_per_element=bytes_per_elem,
+            total_uploaded_bytes=total_uploaded * bytes_per_elem,
+            optimal_bytes=optimal_elements * bytes_per_elem,
+            redundancy_bytes=redundancy_elements * bytes_per_elem,
+            is_upload_optimal=is_upload_optimal,
+            download_elements=download_elements,
+            optimal_download_elements=optimal_download,
+            download_redundancy_ratio=download_redundancy_ratio,
+            is_download_optimal=is_download_optimal,
+        )
 
     @classmethod
     def profile_block_3d(
@@ -328,3 +441,53 @@ class BandwidthProfiler:
             current = end
 
         return current == k
+
+    @classmethod
+    def verify_2d_grid_coverage(
+        cls,
+        tasks: List[Union[TileTaskPlan, Dict[str, Any]]],
+        m: int,
+        n: int,
+    ) -> bool:
+        """
+        Verifies that [row_slice, col_slice] blocks across all tasks form
+        an exact, contiguous, disjoint cover of [0, M) x [0, N) with zero gaps,
+        zero overlaps, and zero out-of-bounds tiles.
+        """
+        if not tasks or m < 1 or n < 1:
+            return False
+
+        rectangles: List[Tuple[int, int, int, int]] = []
+        total_area = 0
+
+        for t in tasks:
+            if isinstance(t, TileTaskPlan):
+                rs, re = t.row_slice
+                cs, ce = t.col_slice
+            elif isinstance(t, dict):
+                rs, re = t.get("row_slice", (0, 0))
+                cs, ce = t.get("col_slice", (0, 0))
+            else:
+                rs, re = getattr(t, "row_slice", (0, 0))
+                cs, ce = getattr(t, "col_slice", (0, 0))
+
+            if rs < 0 or cs < 0 or re > m or ce > n or re <= rs or ce <= cs:
+                return False
+
+            rectangles.append((rs, re, cs, ce))
+            total_area += (re - rs) * (ce - cs)
+
+        if total_area != m * n:
+            return False
+
+        # Check pairwise disjointness
+        for i in range(len(rectangles)):
+            r1_s, r1_e, c1_s, c1_e = rectangles[i]
+            for j in range(i + 1, len(rectangles)):
+                r2_s, r2_e, c2_s, c2_e = rectangles[j]
+                if max(r1_s, r2_s) < min(r1_e, r2_e) and max(c1_s, c2_s) < min(c1_e, c2_e):
+                    return False
+
+        return True
+
+    verify_spatial_grid_coverage = verify_2d_grid_coverage

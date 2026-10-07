@@ -6,7 +6,7 @@ from enum import Enum
 import json
 import os
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -94,6 +94,20 @@ class ClientConfig(BaseModel):
         ge=1,
         description="Explicit strip count for 1D outer-product partitioning; defaults to worker count or tile_size heuristic",
     )
+    grid_rows: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Explicit row partition count P_r for 2D output grid; defaults to worker count factor or tile_size heuristic",
+    )
+    grid_cols: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Explicit column partition count P_c for 2D output grid; defaults to worker count factor or tile_size heuristic",
+    )
+    grid_shape: Optional[Tuple[int, int]] = Field(
+        default=None,
+        description="Explicit (P_r, P_c) partition shape for 2D output grid",
+    )
     lease_ttl_seconds: int = Field(
         default=3600,
         ge=1,
@@ -180,6 +194,18 @@ class ClientConfig(BaseModel):
                 "NUM_STRIPS",
                 "MATRIX_STRIPS",
             ],
+            "grid_rows": [
+                "MATRIX_GRID_ROWS",
+                "GRID_ROWS",
+                "MATRIX_P_R",
+                "P_R",
+            ],
+            "grid_cols": [
+                "MATRIX_GRID_COLS",
+                "GRID_COLS",
+                "MATRIX_P_C",
+                "P_C",
+            ],
             "lease_ttl_seconds": [
                 "MATRIX_LEASE_TTL_SECONDS",
                 "LEASE_TTL_SECONDS",
@@ -232,6 +258,20 @@ class ClientConfig(BaseModel):
             enriched.setdefault("mock_settlement", True)
             enriched.setdefault("mock_workers", True)
 
+        # Support p_r and p_c input aliases
+        if "p_r" in enriched and ("grid_rows" not in enriched or enriched["grid_rows"] is None):
+            enriched["grid_rows"] = enriched["p_r"]
+        if "p_c" in enriched and ("grid_cols" not in enriched or enriched["grid_cols"] is None):
+            enriched["grid_cols"] = enriched["p_c"]
+
+        # Parse string integer representations for grid dimensions
+        for int_field in ("grid_rows", "grid_cols", "num_strips"):
+            if int_field in enriched and isinstance(enriched[int_field], str):
+                try:
+                    enriched[int_field] = int(enriched[int_field].strip())
+                except ValueError:
+                    pass
+
         # Parse nostr_relays list from string or JSON
         if "nostr_relays" in enriched and isinstance(enriched["nostr_relays"], str):
             raw = enriched["nostr_relays"].strip()
@@ -278,6 +318,10 @@ class ClientConfig(BaseModel):
             "2d_output_grid": PartitioningStrategy.OUTPUT_GRID_2D,
             "outputgrid2d": PartitioningStrategy.OUTPUT_GRID_2D,
             "grid_2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "output_2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "output2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "2d": PartitioningStrategy.OUTPUT_GRID_2D,
+            "2d_grid": PartitioningStrategy.OUTPUT_GRID_2D,
             "3d_block": PartitioningStrategy.BLOCK_3D,
             "block3d": PartitioningStrategy.BLOCK_3D,
             "block": PartitioningStrategy.BLOCK_3D,
@@ -359,6 +403,49 @@ class ClientConfig(BaseModel):
             if parsed.scheme not in ("ws", "wss", "http", "https"):
                 raise ValueError(f"Invalid relay URL scheme in '{r}'; expected ws, wss, http, or https")
         return v
+
+    @model_validator(mode="after")
+    def validate_and_sync_grid_shape(self) -> "ClientConfig":
+        """Validates and synchronizes grid_rows, grid_cols, and grid_shape."""
+        if self.grid_shape is not None:
+            if not (isinstance(self.grid_shape, (tuple, list)) and len(self.grid_shape) == 2):
+                raise ValueError(
+                    f"grid_shape must be a 2-tuple of integers (grid_rows, grid_cols), got '{self.grid_shape}'"
+                )
+            r, c = self.grid_shape[0], self.grid_shape[1]
+            if not isinstance(r, int) or not isinstance(c, int):
+                try:
+                    r, c = int(r), int(c)
+                except (ValueError, TypeError):
+                    raise ValueError(f"grid_shape dimensions must be integers, got {self.grid_shape}")
+            if r < 1 or c < 1:
+                raise ValueError(f"grid_shape dimensions must be >= 1, got {self.grid_shape}")
+
+            if self.grid_rows is not None and self.grid_rows != r:
+                raise ValueError(
+                    f"Conflicting configuration: grid_rows={self.grid_rows} conflicts with grid_shape={self.grid_shape}"
+                )
+            if self.grid_cols is not None and self.grid_cols != c:
+                raise ValueError(
+                    f"Conflicting configuration: grid_cols={self.grid_cols} conflicts with grid_shape={self.grid_shape}"
+                )
+            self.grid_rows = r
+            self.grid_cols = c
+            self.grid_shape = (r, c)
+        elif self.grid_rows is not None and self.grid_cols is not None:
+            self.grid_shape = (self.grid_rows, self.grid_cols)
+
+        return self
+
+    @property
+    def p_r(self) -> Optional[int]:
+        """Alias for grid_rows (row partitions)."""
+        return self.grid_rows
+
+    @property
+    def p_c(self) -> Optional[int]:
+        """Alias for grid_cols (column partitions)."""
+        return self.grid_cols
 
     @classmethod
     def load(cls, **kwargs: Any) -> "ClientConfig":

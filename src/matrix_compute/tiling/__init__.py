@@ -21,6 +21,10 @@ from .partitioner import (
 from .assembler import (
     ResultAssembler,
 )
+from .profiler import (
+    BandwidthProfile,
+    BandwidthProfiler,
+)
 
 __all__ = [
     # Precision
@@ -41,4 +45,7 @@ __all__ = [
     "compute_1d_strips",
     # Assembly
     "ResultAssembler",
+    # Profiler
+    "BandwidthProfile",
+    "BandwidthProfiler",
 ]

@@ -118,6 +118,8 @@ class TileGridPlan:
         if self.strategy is None:
             if self.num_m_blocks == 1 and self.num_n_blocks == 1:
                 self.strategy = "outer_product_1d"
+            elif self.num_k_blocks == 1 and (self.num_m_blocks > 1 or self.num_n_blocks > 1):
+                self.strategy = "output_grid_2d"
             else:
                 self.strategy = "block_3d"
 
@@ -125,6 +127,26 @@ class TileGridPlan:
     def p(self) -> int:
         """Alias for num_k_blocks (the number of strips / partitions along dimension K)."""
         return self.num_k_blocks
+
+    @property
+    def p_r(self) -> int:
+        """Alias for num_m_blocks (row partitions)."""
+        return self.num_m_blocks
+
+    @property
+    def p_c(self) -> int:
+        """Alias for num_n_blocks (column partitions)."""
+        return self.num_n_blocks
+
+    @property
+    def k_blocks(self) -> int:
+        """Alias for num_k_blocks (K partitions)."""
+        return self.num_k_blocks
+
+    @property
+    def grid_shape(self) -> Tuple[int, int]:
+        """2D processor grid shape (P_r, P_c)."""
+        return (self.num_m_blocks, self.num_n_blocks)
 
     def iter_tasks(self) -> Iterator[TileTaskPlan]:
         return iter(self.tasks)
@@ -160,6 +182,10 @@ class TileGridPlan:
             "tasks",
             "strategy",
             "p",
+            "p_r",
+            "p_c",
+            "k_blocks",
+            "grid_shape",
         ]
 
     def values(self) -> List[Any]:
@@ -170,6 +196,45 @@ class TileGridPlan:
 
     def __contains__(self, key: str) -> bool:
         return hasattr(self, key)
+
+
+def compute_2d_grid_intervals(dimension: int, num_blocks: int) -> List[Tuple[int, int]]:
+    """
+    Computes 1D block intervals [start, end) along a spatial dimension (M or N).
+
+    Clamps p_effective = min(max(1, int(num_blocks)), dimension) ensuring 1 <= p_effective <= dimension.
+    Distributes remainder r = dimension % p_effective across the first r blocks:
+    - First r blocks have length q + 1
+    - Remaining p_effective - r blocks have length q
+
+    Args:
+        dimension: Spatial dimension length (must be >= 1).
+        num_blocks: Target number of partition blocks.
+
+    Returns:
+        List of (start, end) tuples forming a contiguous, disjoint partition of [0, dimension).
+
+    Raises:
+        ValueError: If dimension < 1.
+    """
+    if dimension < 1:
+        raise ValueError(f"Dimension must be >= 1, got {dimension}")
+
+    p_effective = min(max(1, int(num_blocks)), dimension)
+    q = dimension // p_effective
+    r = dimension % p_effective
+
+    intervals: List[Tuple[int, int]] = []
+    curr = 0
+    for i in range(p_effective):
+        block_len = q + 1 if i < r else q
+        intervals.append((curr, curr + block_len))
+        curr += block_len
+
+    return intervals
+
+
+compute_grid_intervals = compute_2d_grid_intervals
 
 
 def compute_1d_strips(k: int, p: int) -> List[Tuple[int, int]]:
@@ -338,6 +403,209 @@ class MatrixTiler:
         )
 
     @classmethod
+    def create_plan_output_grid_2d(
+        cls,
+        a: np.ndarray,
+        b: np.ndarray,
+        grid_rows: Optional[int] = None,
+        grid_cols: Optional[int] = None,
+        grid_shape: Optional[Tuple[int, int]] = None,
+        p_r: Optional[int] = None,
+        p_c: Optional[int] = None,
+        tile_size: Optional[int] = None,
+        dtype: Optional[str] = "fp32",
+        job_id: Optional[str] = None,
+        task_id_prefix: Optional[str] = None,
+        **kwargs: Any,
+    ) -> TileGridPlan:
+        """
+        Creates a TileGridPlan partitioning spatial dimensions M into P_r and N into P_c
+        with inner dimension K strictly unsliced (K-block count = 1).
+
+        Args:
+            a: Input matrix A of shape (M, K).
+            b: Input matrix B of shape (K, N).
+            grid_rows: Explicit row partition count P_r.
+            grid_cols: Explicit column partition count P_c.
+            grid_shape: Explicit (P_r, P_c) partition shape.
+            p_r: Alias for grid_rows.
+            p_c: Alias for grid_cols.
+            tile_size: Optional tile size override used as fallback to derive P_r and P_c.
+            dtype: Precision identifier ("fp32", "fp16", "bf16").
+            job_id: Optional job identifier prefix.
+            task_id_prefix: Optional task id prefix alias.
+
+        Returns:
+            TileGridPlan manifest with P_r_effective x P_c_effective TileTaskPlans.
+        """
+        if not isinstance(a, np.ndarray) or not isinstance(b, np.ndarray):
+            raise MatrixDimensionError(
+                "Matrices A and B must be numpy.ndarray instances",
+                shape_a=getattr(a, "shape", None),
+                shape_b=getattr(b, "shape", None),
+            )
+
+        if a.ndim != 2 or b.ndim != 2:
+            raise MatrixDimensionError(
+                f"Matrices must be 2-dimensional. Got shapes {a.shape} and {b.shape}",
+                shape_a=a.shape,
+                shape_b=b.shape,
+            )
+
+        m, k = a.shape
+        k2, n = b.shape
+
+        if k != k2:
+            raise MatrixDimensionError(
+                f"Dimension mismatch: A columns ({k}) != B rows ({k2})",
+                shape_a=a.shape,
+                shape_b=b.shape,
+                expected_inner_dim=k,
+            )
+
+        if m == 0 or k == 0 or n == 0:
+            raise MatrixDimensionError(
+                f"Matrix dimensions must be non-zero. Got {a.shape} and {b.shape}",
+                shape_a=a.shape,
+                shape_b=b.shape,
+            )
+
+        norm_dtype = normalize_dtype(dtype or "fp32")
+        a_cast = cast_matrix(a, norm_dtype)
+        b_cast = cast_matrix(b, norm_dtype)
+
+        # Resolve requested P_r and P_c
+        req_r = None
+        req_c = None
+        if grid_shape is not None:
+            if not (isinstance(grid_shape, (tuple, list)) and len(grid_shape) == 2):
+                raise ValueError(f"grid_shape must be a 2-tuple of integers, got {grid_shape}")
+            req_r, req_c = int(grid_shape[0]), int(grid_shape[1])
+
+        if grid_rows is not None:
+            req_r = int(grid_rows)
+        elif p_r is not None:
+            req_r = int(p_r)
+
+        if grid_cols is not None:
+            req_c = int(grid_cols)
+        elif p_c is not None:
+            req_c = int(p_c)
+
+        if req_r is not None and req_r < 1:
+            raise ValueError(f"grid_rows must be >= 1, got {req_r}")
+        if req_c is not None and req_c < 1:
+            raise ValueError(f"grid_cols must be >= 1, got {req_c}")
+
+        if tile_size is not None and int(tile_size) < 1:
+            raise ValueError(f"tile_size must be >= 1, got {tile_size}")
+
+        if req_r is None:
+            if tile_size is not None:
+                req_r = max(1, math.ceil(m / int(tile_size)))
+            else:
+                req_r = max(1, math.ceil(m / 1024))
+
+        if req_c is None:
+            if tile_size is not None:
+                req_c = max(1, math.ceil(n / int(tile_size)))
+            else:
+                req_c = max(1, math.ceil(n / 1024))
+
+        row_intervals = compute_2d_grid_intervals(m, req_r)
+        col_intervals = compute_2d_grid_intervals(n, req_c)
+
+        p_r_eff = len(row_intervals)
+        p_c_eff = len(col_intervals)
+
+        prefix = job_id or task_id_prefix or "tile"
+        tasks: List[TileTaskPlan] = []
+        total_gflops = 0.0
+
+        for i, (r_s, r_e) in enumerate(row_intervals):
+            m_i = r_e - r_s
+            a_tile = a_cast[r_s:r_e, 0:k]
+
+            for j, (c_s, c_e) in enumerate(col_intervals):
+                n_j = c_e - c_s
+                b_tile = b_cast[0:k, c_s:c_e]
+
+                gflops = cls.calculate_gflops(m_i, k, n_j)
+                total_gflops += gflops
+
+                task_id = f"{prefix}_{i}_{j}"
+
+                tasks.append(
+                    TileTaskPlan(
+                        task_id=task_id,
+                        row_idx=i,
+                        col_idx=j,
+                        k_idx=0,
+                        row_slice=(r_s, r_e),
+                        col_slice=(c_s, c_e),
+                        k_slice=(0, k),
+                        a_tile=a_tile,
+                        b_tile=b_tile,
+                        dtype=norm_dtype,
+                        estimated_gflops=gflops,
+                    )
+                )
+
+        eff_tile_size = (
+            int(tile_size)
+            if tile_size is not None
+            else max(math.ceil(m / p_r_eff), math.ceil(n / p_c_eff))
+        )
+
+        return TileGridPlan(
+            m=m,
+            k=k,
+            n=n,
+            tile_size=eff_tile_size,
+            dtype=norm_dtype,
+            num_m_blocks=p_r_eff,
+            num_k_blocks=1,
+            num_n_blocks=p_c_eff,
+            total_tasks=len(tasks),
+            total_gflops=total_gflops,
+            tasks=tasks,
+            strategy="output_grid_2d",
+        )
+
+    @classmethod
+    def partition_output_grid_2d(
+        cls,
+        a: np.ndarray,
+        b: np.ndarray,
+        grid_rows: Optional[int] = None,
+        grid_cols: Optional[int] = None,
+        grid_shape: Optional[Tuple[int, int]] = None,
+        p_r: Optional[int] = None,
+        p_c: Optional[int] = None,
+        tile_size: Optional[int] = None,
+        dtype: Optional[str] = "fp32",
+        job_id: Optional[str] = None,
+        task_id_prefix: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[TileTaskPlan]:
+        """Partitions matrices into a flat list of 2D output grid tasks."""
+        plan = cls.create_plan_output_grid_2d(
+            a=a,
+            b=b,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            grid_shape=grid_shape,
+            p_r=p_r,
+            p_c=p_c,
+            tile_size=tile_size,
+            dtype=dtype,
+            job_id=job_id,
+            task_id_prefix=task_id_prefix,
+            **kwargs,
+        )
+        return plan.tasks
+
+    @classmethod
     def partition_outer_product_1d(
         cls,
         a: np.ndarray,
@@ -450,8 +718,26 @@ class MatrixTiler:
             "outputgrid2d",
             "grid_2d",
             "output_2d",
+            "output2d",
+            "2d",
+            "2d_grid",
         ):
-            raise NotImplementedError("OUTPUT_GRID_2D partitioning is planned for a future milestone")
+            g_rows = kwargs.get("grid_rows") or kwargs.get("p_r")
+            g_cols = kwargs.get("grid_cols") or kwargs.get("p_c")
+            g_shape = kwargs.get("grid_shape")
+            job_id = kwargs.get("job_id") or task_id_prefix
+            return cls.create_plan_output_grid_2d(
+                a=a,
+                b=b,
+                grid_rows=g_rows,
+                grid_cols=g_cols,
+                grid_shape=g_shape,
+                tile_size=tile_size,
+                dtype=dtype,
+                job_id=job_id,
+                task_id_prefix=task_id_prefix,
+                **{k: v for k, v in kwargs.items() if k not in ("grid_rows", "grid_cols", "p_r", "p_c", "grid_shape", "job_id")},
+            )
 
         if strat_norm not in ("block_3d", "block", "3d", "3d_block", "block3d"):
             raise ValueError(f"Unknown partitioning strategy: '{raw_strat}'")

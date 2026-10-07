@@ -81,6 +81,7 @@ class PipelinedTaskContext:
     candidates: List[Any]
     escrow: Any
     assigned_pubkey: str
+    is_failed_over: bool = False
 
 
 class DistributedMatmulCoordinator:
@@ -132,6 +133,9 @@ class DistributedMatmulCoordinator:
         tile_size: int = 1024,
         partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
         num_strips: Optional[int] = None,
+        grid_rows: Optional[int] = None,
+        grid_cols: Optional[int] = None,
+        grid_shape: Optional[Tuple[int, int]] = None,
         **kwargs: Any,
     ) -> np.ndarray:
         """
@@ -167,13 +171,14 @@ class DistributedMatmulCoordinator:
             "outputgrid2d",
             "grid_2d",
             "output_2d",
+            "output2d",
+            "2d",
+            "2d_grid",
         )
-        if is_output_2d:
-            raise NotImplementedError("OUTPUT_GRID_2D partitioning is planned for a future milestone")
-        if not is_outer_1d and strat_norm not in ("block_3d", "block", "3d", "3d_block", "block3d"):
+        if not is_outer_1d and not is_output_2d and strat_norm not in ("block_3d", "block", "3d", "3d_block", "block3d"):
             raise ValueError(f"Unknown partitioning strategy: '{raw_strategy}'")
 
-        # 2. Resolve strip count (num_strips) precedence
+        # 2. Resolve strip count (num_strips) precedence for 1D outer product
         resolved_num_strips: Optional[int] = None
         if is_outer_1d:
             if num_strips is not None:
@@ -192,12 +197,78 @@ class DistributedMatmulCoordinator:
             if resolved_num_strips is None or resolved_num_strips < 1:
                 resolved_num_strips = max(1, math.ceil(k / int(effective_tile_size)))
 
+        # 2b. Resolve grid dimensions (P_r, P_c) precedence for 2D output grid
+        resolved_grid_rows: Optional[int] = None
+        resolved_grid_cols: Optional[int] = None
+        if is_output_2d:
+            grid_shape_arg = grid_shape or kwargs.get("grid_shape") or getattr(self.config, "grid_shape", None)
+            if grid_shape_arg:
+                resolved_grid_rows, resolved_grid_cols = int(grid_shape_arg[0]), int(grid_shape_arg[1])
+
+            if grid_rows is not None:
+                resolved_grid_rows = int(grid_rows)
+            elif kwargs.get("grid_rows") is not None:
+                resolved_grid_rows = int(kwargs["grid_rows"])
+            elif kwargs.get("p_r") is not None:
+                resolved_grid_rows = int(kwargs["p_r"])
+            elif getattr(self.config, "grid_rows", None) is not None and resolved_grid_rows is None:
+                resolved_grid_rows = int(self.config.grid_rows)
+
+            if grid_cols is not None:
+                resolved_grid_cols = int(grid_cols)
+            elif kwargs.get("grid_cols") is not None:
+                resolved_grid_cols = int(kwargs["grid_cols"])
+            elif kwargs.get("p_c") is not None:
+                resolved_grid_cols = int(kwargs["p_c"])
+            elif getattr(self.config, "grid_cols", None) is not None and resolved_grid_cols is None:
+                resolved_grid_cols = int(self.config.grid_cols)
+
+            # Heuristic factorization if neither is explicitly provided
+            if resolved_grid_rows is None and resolved_grid_cols is None:
+                cands = kwargs.get("candidate_workers") or kwargs.get("candidates")
+                w_count = len(cands) if cands else (len(self.mock_workers) if self.mock_workers else 0)
+                if w_count > 0:
+                    best_r, best_c = 1, w_count
+                    min_diff = float("inf")
+                    target_ratio = float(m) / float(n) if n > 0 else 1.0
+                    for r in range(1, w_count + 1):
+                        if w_count % r == 0:
+                            c = w_count // r
+                            ratio = float(r) / float(c)
+                            diff = abs(ratio - target_ratio)
+                            if diff < min_diff:
+                                min_diff = diff
+                                best_r, best_c = r, c
+                    resolved_grid_rows, resolved_grid_cols = best_r, best_c
+
+            if resolved_grid_rows is None:
+                resolved_grid_rows = max(1, math.ceil(m / int(effective_tile_size)))
+            if resolved_grid_cols is None:
+                resolved_grid_cols = max(1, math.ceil(n / int(effective_tile_size)))
+
         # 3. Create tiling plan
         tiler_kwargs = {
             k_arg: v_arg
             for k_arg, v_arg in kwargs.items()
-            if k_arg not in ("strategy", "partitioning_strategy", "num_strips", "job_id", "task_id_prefix", "tile_size", "dtype")
+            if k_arg not in (
+                "strategy",
+                "partitioning_strategy",
+                "num_strips",
+                "grid_rows",
+                "grid_cols",
+                "grid_shape",
+                "p_r",
+                "p_c",
+                "job_id",
+                "task_id_prefix",
+                "tile_size",
+                "dtype",
+            )
         }
+        if is_output_2d:
+            tiler_kwargs["grid_rows"] = resolved_grid_rows
+            tiler_kwargs["grid_cols"] = resolved_grid_cols
+
         grid_plan = MatrixTiler.create_plan(
             a=A,
             b=B,
@@ -233,7 +304,10 @@ class DistributedMatmulCoordinator:
             )
 
         # 3. Result Assembler setup
-        assembler = ResultAssembler.from_plan(grid_plan)
+        assembler = ResultAssembler.from_plan(
+            grid_plan,
+            zero_reduction=True if is_output_2d else None,
+        )
         self._last_assembler = assembler
 
         # 4. Pre-group scheduled tasks by assigned worker
@@ -349,7 +423,11 @@ class DistributedMatmulCoordinator:
                         candidates=candidates_map[i],
                         escrow=escrow_map[i],
                         assigned_pubkey=pubkey_map[i],
+                        is_failed_over=False,
                     )
+
+                    def _on_failover(failed_w: Any, exc: Exception, context: PipelinedTaskContext = ctx) -> None:
+                        context.is_failed_over = True
 
                     fut = self.scheduler.submit_tile(
                         task_plan=task_plan,
@@ -358,6 +436,7 @@ class DistributedMatmulCoordinator:
                         payment_hash=ctx.escrow.payment_hash,
                         dtype=dtype,
                         timeout=self.config.task_timeout_seconds,
+                        on_failover_callback=_on_failover,
                         escrow_manager=self.escrow_manager,
                     )
                     in_flight_futures[fut] = ctx
@@ -379,6 +458,9 @@ class DistributedMatmulCoordinator:
 
                 try:
                     tile_c, raw_result = fut.result()
+                    actual_pubkey = getattr(raw_result, "worker_pubkey", None)
+                    if actual_pubkey and ctx.assigned_pubkey and actual_pubkey != ctx.assigned_pubkey:
+                        ctx.is_failed_over = True
                 except Exception as ex:
                     if first_fraud_error is not None:
                         for pending_fut in list(in_flight_futures.keys()):
@@ -418,7 +500,19 @@ class DistributedMatmulCoordinator:
                             task_id=ctx.task_plan.task_id,
                         )
                         manifest.completed_tasks += 1
-                        worker_verified[i] += 1
+                        # Failover Batch Escrow accounting:
+                        # Only credit the originally assigned worker if that worker actually executed the task.
+                        # If the task failed and was failed over to a backup worker, do NOT increment
+                        # the original failed worker's batch verified count, preventing double payment /
+                        # premature release of the failed worker's escrow.
+                        if not ctx.is_failed_over:
+                            worker_verified[i] += 1
+                        else:
+                            logger.info(
+                                "Tile task %s was completed via failover; excluding from original worker %s batch verified count",
+                                ctx.task_plan.task_id,
+                                ctx.assigned_pubkey,
+                            )
                         del tile_c  # discard transient tile buffer immediately to enforce O(W * tile_size^2) memory
                         raw_result = None
                         if hasattr(fut, "_result"):
@@ -540,6 +634,18 @@ class DistributedMatmulCoordinator:
 
         if first_fraud_error is not None:
             raise first_fraud_error
+
+        # Clean up and refund any batch escrows that were not fully verified by their original worker
+        # (e.g. because one or more tasks failed and were failed over to a backup worker)
+        for g_idx, (_, _, esc) in enumerate(worker_group_escrows):
+            if worker_verified[g_idx] < worker_total_tasks[g_idx]:
+                try:
+                    if hasattr(self.escrow_manager, "abort_and_refund"):
+                        self.escrow_manager.abort_and_refund(esc.payment_hash, reason="failover_incomplete_batch")
+                    elif hasattr(self.escrow_manager, "cancel_escrow"):
+                        self.escrow_manager.cancel_escrow(esc.payment_hash, reason="failover_incomplete_batch")
+                except Exception:
+                    pass
 
         final_c = assembler.get_result(enforce_complete=True)
 

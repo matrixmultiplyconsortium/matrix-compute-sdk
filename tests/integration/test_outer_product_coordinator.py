@@ -189,12 +189,13 @@ class TestCoordinatorStrategyRouting:
         assert manifest.total_tasks == 8  # 3D block 2x2x2
 
     def test_unimplemented_2d_strategy_raises_not_implemented(self, hermetic_env: Dict[str, Any]):
+        # Phase 2: OUTPUT_GRID_2D is now fully implemented and executes cleanly
         coord: DistributedMatmulCoordinator = hermetic_env["coordinator"]
         a = np.ones((16, 16), dtype=np.float32)
         b = np.ones((16, 16), dtype=np.float32)
 
-        with pytest.raises(NotImplementedError, match="OUTPUT_GRID_2D"):
-            coord.execute_gemm(a, b, partitioning_strategy="output_grid_2d")
+        result = coord.execute_gemm(a, b, partitioning_strategy="output_grid_2d")
+        np.testing.assert_allclose(result, np.matmul(a, b), atol=1e-5)
 
     def test_unknown_strategy_raises_value_error(self, hermetic_env: Dict[str, Any]):
         coord: DistributedMatmulCoordinator = hermetic_env["coordinator"]

@@ -31,6 +31,7 @@ class ResultAssembler:
         expected_tasks: Optional[Union[int, List[TileTaskPlan], Set[str], List[Any]]] = None,
         dtype: str = "fp32",
         allow_duplicate: bool = False,
+        zero_reduction: Optional[bool] = None,
     ) -> None:
         if m < 1 or n < 1:
             raise ValueError(f"Matrix dimensions must be >= 1. Got m={m}, n={n}")
@@ -40,6 +41,15 @@ class ResultAssembler:
         self._k_blocks = k_blocks
         self._dtype = normalize_dtype(dtype)
         self._allow_duplicate = allow_duplicate
+
+        if zero_reduction is not None:
+            self._zero_reduction = bool(zero_reduction)
+        elif k_blocks is not None and k_blocks == 1:
+            self._zero_reduction = True
+        else:
+            self._zero_reduction = False
+
+        self._reduction_ops: int = 0
 
         # Internal accumulation buffer (stored in float32 for fp32 and bf16, float16 for fp16, float64 for fp64)
         if self._dtype == "fp16":
@@ -57,6 +67,10 @@ class ResultAssembler:
         # Task completion tracking
         self._received_tasks: Set[str] = set()
         self._received_coords: Set[Tuple[int, int, int]] = set()
+
+        # Spatial slice disjointness tracking: (r_s, r_e, c_s, c_e, k_idx, coord)
+        self._placed_slices: List[Tuple[int, int, int, int, int, Tuple[int, int, int]]] = []
+        self._covered_elements: int = 0
 
         # Expected tasks tracking
         self._expected_task_ids: Optional[Set[str]] = None
@@ -78,9 +92,29 @@ class ResultAssembler:
             self._expected_task_ids = set(str(t) for t in expected_tasks)
             self._expected_count = len(self._expected_task_ids)
 
+    @property
+    def reduction_ops(self) -> int:
+        """Count of local floating-point reduction addition operations executed during assembly."""
+        return self._reduction_ops
+
+    @property
+    def zero_reduction(self) -> bool:
+        """Whether zero-reduction direct coordinate placement is enabled."""
+        return self._zero_reduction
+
     @classmethod
-    def from_plan(cls, plan: TileGridPlan, allow_duplicate: bool = False) -> ResultAssembler:
+    def from_plan(
+        cls,
+        plan: TileGridPlan,
+        allow_duplicate: bool = False,
+        zero_reduction: Optional[bool] = None,
+    ) -> ResultAssembler:
         """Creates a ResultAssembler pre-configured with the full TileGridPlan manifest."""
+        eff_zero_reduction = (
+            zero_reduction
+            if zero_reduction is not None
+            else (plan.strategy == "output_grid_2d" or plan.num_k_blocks == 1)
+        )
         return cls(
             m=plan.m,
             n=plan.n,
@@ -88,6 +122,7 @@ class ResultAssembler:
             expected_tasks=plan.tasks,
             dtype=plan.dtype,
             allow_duplicate=allow_duplicate,
+            zero_reduction=eff_zero_reduction,
         )
 
     def accumulate(
@@ -134,8 +169,37 @@ class ResultAssembler:
                     f"Duplicate accumulation rejected for coordinate (r={row_idx}, c={col_idx}, k={k_idx})"
                 )
 
-            # Perform in-place accumulation
-            self._buffer[r_s:r_e, c_s:c_e] += tile_result.astype(self._buf_dtype)
+            # Spatial slice disjointness validation:
+            # Slices must be mutually disjoint in 2D spatial coordinate space to prevent rogue
+            # overlapping slices from silently overwriting or corrupting already placed regions.
+            # In zero-reduction mode, all slices must be mutually disjoint across the entire grid.
+            # In reduction mode, slices sharing the same k_idx must be mutually disjoint.
+            is_exact_rewrite = False
+            for p_rs, p_re, p_cs, p_ce, p_k, p_coord in self._placed_slices:
+                if self._zero_reduction or p_k == k_idx:
+                    # Check 2D bounding rectangle intersection: [r_s, r_e) x [c_s, c_e)
+                    has_overlap = max(r_s, p_rs) < min(r_e, p_re) and max(c_s, p_cs) < min(c_e, p_ce)
+                    if has_overlap:
+                        if self._allow_duplicate and coord == p_coord and (r_s, r_e, c_s, c_e) == (p_rs, p_re, p_cs, p_ce):
+                            is_exact_rewrite = True
+                        else:
+                            raise TilingError(
+                                f"Overlapping spatial slice detected: rows {r_s}:{r_e}, cols {c_s}:{c_e} "
+                                f"overlaps with previously placed slice rows {p_rs}:{p_re}, cols {p_cs}:{p_ce} (k={p_k})"
+                            )
+
+            # Perform direct placement if zero_reduction, otherwise in-place accumulation
+            if self._zero_reduction:
+                self._buffer[r_s:r_e, c_s:c_e] = tile_result.astype(self._buf_dtype)
+            else:
+                self._buffer[r_s:r_e, c_s:c_e] += tile_result.astype(self._buf_dtype)
+                self._reduction_ops += tile_result.size
+
+            if not is_exact_rewrite:
+                self._placed_slices.append((r_s, r_e, c_s, c_e, k_idx, coord))
+                if self._zero_reduction:
+                    self._covered_elements += (r_e - r_s) * (c_e - c_s)
+
             self._received_coords.add(coord)
             self._received_tasks.add(eff_task_id)
 
@@ -162,17 +226,25 @@ class ResultAssembler:
         """Returns True if all expected tile tasks have been accumulated."""
         with self._lock:
             if self._expected_task_ids is not None:
-                return self._expected_task_ids.issubset(self._received_tasks)
+                return (
+                    len(self._expected_task_ids) > 0
+                    and self._expected_task_ids.issubset(self._received_tasks)
+                )
             if self._expected_count is not None:
-                return len(self._received_tasks) >= self._expected_count
-            return len(self._received_tasks) > 0
+                return self._expected_count > 0 and len(self._received_tasks) >= self._expected_count
+            if self._zero_reduction:
+                return self._covered_elements >= (self._m * self._n)
+            return False
 
     def get_progress(self) -> float:
         """Returns progress fraction from 0.0 to 1.0."""
         with self._lock:
-            if not self._expected_count:
-                return 0.0 if not self._received_tasks else 1.0
-            return min(1.0, len(self._received_tasks) / float(self._expected_count))
+            if self._expected_count and self._expected_count > 0:
+                return min(1.0, len(self._received_tasks) / float(self._expected_count))
+            if self._zero_reduction:
+                total_elem = self._m * self._n
+                return min(1.0, float(self._covered_elements) / float(total_elem))
+            return 0.0 if not self._received_tasks else 1.0
 
     def missing_tasks(self) -> List[str]:
         """Returns list of expected task IDs that have not yet been accumulated."""
@@ -212,6 +284,9 @@ class ResultAssembler:
             self._buffer.fill(0)
             self._received_tasks.clear()
             self._received_coords.clear()
+            self._placed_slices.clear()
+            self._covered_elements = 0
+            self._reduction_ops = 0
 
     @classmethod
     def assemble_tiles(
@@ -220,11 +295,18 @@ class ResultAssembler:
         n: int,
         tile_tasks: List[Union[TileTaskPlan, Dict[str, Any]]],
         dtype: str = "fp32",
+        zero_reduction: Optional[bool] = None,
     ) -> np.ndarray:
         """
         Drop-in reference compatible accumulator that iterates over tasks and sums their products.
         """
-        assembler = cls(m=m, n=n, expected_tasks=len(tile_tasks), dtype=dtype)
+        assembler = cls(
+            m=m,
+            n=n,
+            expected_tasks=len(tile_tasks),
+            dtype=dtype,
+            zero_reduction=zero_reduction,
+        )
         for task in tile_tasks:
             r_s, r_e = task["row_slice"]
             c_s, c_e = task["col_slice"]

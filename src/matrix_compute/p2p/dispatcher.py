@@ -91,8 +91,15 @@ class GrpcTaskDispatcher:
         required_tee_type: Optional[str] = None,
         attestation_verifier: Optional[AttestationVerifier] = None,
         config: Optional[Any] = None,
+        signer: Optional[Any] = None,
+        **kwargs: Any,
     ) -> None:
         self.channel_pool = channel_pool or ChannelPool()
+        if signer is not None and not consumer_pubkey:
+            if hasattr(signer, "get_pubkey_hex"):
+                consumer_pubkey = signer.get_pubkey_hex()
+            elif hasattr(signer, "pubkey"):
+                consumer_pubkey = str(signer.pubkey)
         self.consumer_pubkey = consumer_pubkey
         self.connect_timeout = connect_timeout
         self.task_timeout = task_timeout

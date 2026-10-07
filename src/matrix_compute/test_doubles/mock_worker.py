@@ -604,6 +604,23 @@ class MockWorkerNode:
     def set_tamper_task_ids(self, task_ids: Any) -> None:
         self.servicer.tamper_task_ids = set(task_ids)
 
+    def set_fault_mode(self, mode: str) -> None:
+        """Configures worker fault injection mode by name."""
+        norm = str(mode).lower().strip()
+        if norm in ("corrupt_result", "tamper", "corrupt"):
+            self.set_tamper_result(True, perturbation=5.0)
+        elif norm in ("disconnect", "drop", "drop_connection"):
+            self.set_drop_connection(True)
+        elif norm in ("tamper_signature", "bad_signature"):
+            self.set_tamper_signature(True)
+        elif norm in ("reject_handshake", "busy"):
+            self.set_reject_handshake(True)
+        elif norm in ("none", "clean", "reset"):
+            self.set_tamper_result(False)
+            self.set_drop_connection(False)
+            self.set_tamper_signature(False)
+            self.set_reject_handshake(False)
+
     def set_tamper_on_task_count(self, count: Optional[int]) -> None:
         self.servicer.tamper_on_task_count = count
 

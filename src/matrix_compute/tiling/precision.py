@@ -173,16 +173,42 @@ def get_unit_roundoff(dtype: Union[str, np.dtype, type] = "fp32") -> float:
         return 2.0 ** -24
 
 
-def calculate_higham_bound(k: int, norm_a: float, norm_b: float, dtype: Union[str, np.dtype, type] = "fp32") -> float:
+def calculate_higham_bound(
+    k: int,
+    norm_a: Optional[Union[float, np.ndarray]] = None,
+    norm_b: Optional[Union[float, np.ndarray]] = None,
+    dtype: Union[str, np.dtype, type] = "fp32",
+    *,
+    a: Optional[np.ndarray] = None,
+    b: Optional[np.ndarray] = None,
+) -> float:
     """
     Calculates Higham's matrix multiplication rounding bound:
     gamma_K = (K * u) / (1 - K * u)  [or 1000 * K * u if K * u >= 0.999]
     bound = gamma_K * ||A||_inf * ||B||_inf
     """
+    if a is not None:
+        norm_a_val = float(np.max(np.sum(np.abs(a.astype(np.float64)), axis=1))) if a.ndim == 2 and a.size > 0 else 0.0
+    elif isinstance(norm_a, np.ndarray):
+        norm_a_val = float(np.max(np.sum(np.abs(norm_a.astype(np.float64)), axis=1))) if norm_a.ndim == 2 and norm_a.size > 0 else 0.0
+    elif norm_a is not None:
+        norm_a_val = float(norm_a)
+    else:
+        norm_a_val = 1.0
+
+    if b is not None:
+        norm_b_val = float(np.max(np.sum(np.abs(b.astype(np.float64)), axis=1))) if b.ndim == 2 and b.size > 0 else 0.0
+    elif isinstance(norm_b, np.ndarray):
+        norm_b_val = float(np.max(np.sum(np.abs(norm_b.astype(np.float64)), axis=1))) if norm_b.ndim == 2 and norm_b.size > 0 else 0.0
+    elif norm_b is not None:
+        norm_b_val = float(norm_b)
+    else:
+        norm_b_val = 1.0
+
     u = get_unit_roundoff(dtype)
     ku = float(k) * u
     gamma_k = (ku / (1.0 - ku)) if ku < 0.999 else (ku * 1000.0)
-    return gamma_k * float(norm_a) * float(norm_b)
+    return gamma_k * norm_a_val * norm_b_val
 
 
 def emulate_gemm(a: np.ndarray, b: np.ndarray, dtype: Union[str, np.dtype, type] = "fp32") -> np.ndarray:

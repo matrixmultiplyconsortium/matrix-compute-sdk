@@ -92,6 +92,12 @@ class MockSettlementService:
         self.settlement_calls_count: int = 0
         MockSettlementService._instances.append(self)
 
+    @property
+    def invoices(self) -> Dict[str, InvoiceRecord]:
+        """Provides direct dictionary access to internal invoice records."""
+        with self._lock:
+            return dict(self._invoices)
+
     def _mint_macaroon(
         self,
         payment_hash: str,

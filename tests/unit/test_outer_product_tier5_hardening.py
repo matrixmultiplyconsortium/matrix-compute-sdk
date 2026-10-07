@@ -278,10 +278,11 @@ class TestTier5PartitionerHardening:
         a = np.ones((16, 16), dtype=np.float32)
         b = np.ones((16, 16), dtype=np.float32)
 
-        # Unimplemented 2D grid strategy
+        # Fully implemented 2D grid strategy routes cleanly
         for grid_strat in ("output_grid_2d", "output_grid", "2d_output_grid", "grid_2d"):
-            with pytest.raises(NotImplementedError):
-                MatrixTiler.create_plan(a, b, strategy=grid_strat)
+            plan_2d = MatrixTiler.create_plan(a, b, strategy=grid_strat)
+            assert plan_2d.strategy == "output_grid_2d"
+            assert plan_2d.num_k_blocks == 1
 
         # Unknown strategy
         with pytest.raises(ValueError) as exc:

@@ -199,6 +199,9 @@ class MatrixComputeClient:
         tile_size: Optional[int] = None,
         partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
         num_strips: Optional[int] = None,
+        grid_rows: Optional[int] = None,
+        grid_cols: Optional[int] = None,
+        grid_shape: Optional[Tuple[int, int]] = None,
         **kwargs: Any,
     ) -> np.ndarray:
         """
@@ -209,8 +212,11 @@ class MatrixComputeClient:
             B: 2D numpy array of shape (K, N).
             dtype: Target precision format ('fp32', 'fp16', 'bf16'). Defaults to config.dtype_preference.
             tile_size: Block size for matrix partitioning. Defaults to config.default_tile_size.
-            partitioning_strategy: Partitioning strategy (BLOCK_3D, OUTER_PRODUCT_1D). Defaults to config.
+            partitioning_strategy: Partitioning strategy (BLOCK_3D, OUTER_PRODUCT_1D, OUTPUT_GRID_2D). Defaults to config.
             num_strips: Strip count for 1D outer product. Defaults to worker count or tile_size heuristic.
+            grid_rows: Row partition count P_r for 2D output grid.
+            grid_cols: Column partition count P_c for 2D output grid.
+            grid_shape: (P_r, P_c) partition shape for 2D output grid.
             **kwargs: Additional options passed to the coordinator.
 
         Returns:
@@ -269,6 +275,9 @@ class MatrixComputeClient:
             tile_size=eff_tile_size,
             partitioning_strategy=partitioning_strategy,
             num_strips=num_strips,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            grid_shape=grid_shape,
             **kwargs,
         )
 
@@ -326,6 +335,9 @@ def distributed_matmul(
     tile_size: Optional[int] = None,
     partitioning_strategy: Optional[Union[str, PartitioningStrategy]] = None,
     num_strips: Optional[int] = None,
+    grid_rows: Optional[int] = None,
+    grid_cols: Optional[int] = None,
+    grid_shape: Optional[Tuple[int, int]] = None,
     **kwargs: Any,
 ) -> np.ndarray:
     """
@@ -338,10 +350,16 @@ def distributed_matmul(
         client_kwargs["partitioning_strategy"] = partitioning_strategy
     if num_strips is not None and "num_strips" not in client_kwargs:
         client_kwargs["num_strips"] = num_strips
+    if grid_rows is not None and "grid_rows" not in client_kwargs:
+        client_kwargs["grid_rows"] = grid_rows
+    if grid_cols is not None and "grid_cols" not in client_kwargs:
+        client_kwargs["grid_cols"] = grid_cols
+    if grid_shape is not None and "grid_shape" not in client_kwargs:
+        client_kwargs["grid_shape"] = grid_shape
 
     matmul_kwargs = {
         k: v for k, v in kwargs.items()
-        if k not in ("partitioning_strategy", "num_strips")
+        if k not in ("partitioning_strategy", "num_strips", "grid_rows", "grid_cols", "grid_shape")
     }
 
     with MatrixComputeClient(config=config, **client_kwargs) as client:
@@ -352,6 +370,9 @@ def distributed_matmul(
             tile_size=tile_size,
             partitioning_strategy=partitioning_strategy,
             num_strips=num_strips,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            grid_shape=grid_shape,
             **matmul_kwargs,
         )
 

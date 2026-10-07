@@ -256,14 +256,17 @@ class FreivaldsVerifier:
 
         raw_dynamic_bound = gamma_k * scale
 
-        # Calculate effective bound accounting for optional epsilon override
+        # Calculate effective bound accounting for optional epsilon override.
+        # For normalized matrices, maintain Higham precision bound without
+        # artificial 1e-6 clamping that broadens fraud detection blind spots.
+        min_bound_floor = u * scale if scale > 0 else u
         if epsilon is not None:
             if scale >= 1.0:
                 effective_bound = max(raw_dynamic_bound, epsilon)
             else:
-                effective_bound = max(raw_dynamic_bound, epsilon * scale, 1e-6)
+                effective_bound = max(raw_dynamic_bound, epsilon * scale, min_bound_floor)
         else:
-            effective_bound = max(raw_dynamic_bound, 1e-6)
+            effective_bound = max(raw_dynamic_bound, min_bound_floor)
 
         # 4. Randomized Freivalds Trials
         if seed is not None:
@@ -312,14 +315,30 @@ class FreivaldsVerifier:
             cr_norm = float(np.max(np.abs(cr)))
             denom = max(scale, abr_norm, cr_norm)
 
+            # Subnormal underflow guard for floating point hardware:
+            # When matrices have magnitudes near or below FP32 subnormal underflow thresholds (e.g. 1e-25 x 1e-25 = 1e-50),
+            # standard hardware GEMM legitimately flushes products to 0.0 (below IEEE 754 float32 min subnormal ~1.4e-45).
+            # When promoted to float64, abr is non-zero (~1e-49), creating a relative difference of 1.0 against c=0.
+            # When diff is within subnormal underflow range (< 1e-30) and scale or denom indicates underflow,
+            # this is genuine hardware float flushing and must not trigger false fraud alarms.
+            underflow_threshold = 1e-30 if norm_dtype in ("fp32", "float32", "fp16", "float16", "bf16", "bfloat16") else 1e-100
+            is_underflow_regime = scale < underflow_threshold or denom < underflow_threshold
+
             trial_failed = False
-            if denom > 0.0:
+            if scale == 0.0 or norm_a == 0.0 or norm_b == 0.0:
+                # When A=0 or B=0, theoretical product is identically 0.
+                # Evaluates strictly against absolute tolerance floor without relative normalization.
+                if diff > DEFAULT_RELATIVE_TOLERANCE_FLOOR:
+                    trial_failed = True
+            elif is_underflow_regime and diff < underflow_threshold:
+                # Legitimate hardware subnormal underflow to zero; not fraud
+                trial_failed = False
+            elif denom > 0.0:
                 rel_diff = diff / denom
                 allowed_rel = max(gamma_k, epsilon if epsilon is not None else 0.0, DEFAULT_RELATIVE_TOLERANCE_FLOOR)
                 if diff > effective_bound or rel_diff > allowed_rel:
                     trial_failed = True
             else:
-                # scale == 0 (A=0 or B=0) -> A*B == 0. C must be 0.
                 if diff > DEFAULT_RELATIVE_TOLERANCE_FLOOR:
                     trial_failed = True
 
