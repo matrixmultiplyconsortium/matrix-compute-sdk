@@ -23,7 +23,6 @@ from matrix_compute.crypto.attestation_verifier import AttestationVerifier
 from matrix_compute.crypto.pki_fixtures import (
     create_broken_chain_signature_evidence,
     create_valid_attestation_evidence,
-    generate_ephemeral_keypair as gen_pki_keypair,
 )
 from matrix_compute.crypto.session import (
     AES_GCM_IV_BYTES,

@@ -119,6 +119,11 @@ class ClientConfig(BaseModel):
         le=1.0,
         description="Sampling probability for probabilistic Freivalds verification in iterative workloads",
     )
+    default_iterations: int = Field(
+        default=100,
+        ge=1,
+        description="Default step count for iterative power loops",
+    )
 
     # Freivalds Mathematical Verification Parameters
     verification_tolerance: float = Field(
@@ -207,12 +212,21 @@ class ClientConfig(BaseModel):
                 "P_C",
             ],
             "lease_ttl_seconds": [
+                "MATRIX_COMPUTE_LEASE_TTL_SECONDS",
                 "MATRIX_LEASE_TTL_SECONDS",
                 "LEASE_TTL_SECONDS",
             ],
             "spot_check_probability": [
+                "MATRIX_COMPUTE_SPOT_CHECK_PROBABILITY",
                 "MATRIX_SPOT_CHECK_PROBABILITY",
                 "SPOT_CHECK_PROBABILITY",
+            ],
+            "default_iterations": [
+                "MATRIX_COMPUTE_DEFAULT_ITERATIONS",
+                "MATRIX_DEFAULT_ITERATIONS",
+                "DEFAULT_ITERATIONS",
+                "MATRIX_ITERATIONS",
+                "ITERATIONS",
             ],
             "verification_tolerance": ["MATRIX_VERIFICATION_TOLERANCE", "VERIFICATION_TOLERANCE"],
             "use_dynamic_freivalds_bound": ["MATRIX_USE_DYNAMIC_FREIVALDS_BOUND"],
@@ -264,11 +278,27 @@ class ClientConfig(BaseModel):
         if "p_c" in enriched and ("grid_cols" not in enriched or enriched["grid_cols"] is None):
             enriched["grid_cols"] = enriched["p_c"]
 
-        # Parse string integer representations for grid dimensions
-        for int_field in ("grid_rows", "grid_cols", "num_strips"):
+        # Support input aliases for iterative parameters
+        if "iterations" in enriched and ("default_iterations" not in enriched or enriched["default_iterations"] is None):
+            enriched["default_iterations"] = enriched["iterations"]
+        if "ttl_seconds" in enriched and ("lease_ttl_seconds" not in enriched or enriched["lease_ttl_seconds"] is None):
+            enriched["lease_ttl_seconds"] = enriched["ttl_seconds"]
+        if "spot_check_prob" in enriched and ("spot_check_probability" not in enriched or enriched["spot_check_probability"] is None):
+            enriched["spot_check_probability"] = enriched["spot_check_prob"]
+
+        # Parse string integer representations
+        for int_field in ("grid_rows", "grid_cols", "num_strips", "lease_ttl_seconds", "default_iterations"):
             if int_field in enriched and isinstance(enriched[int_field], str):
                 try:
                     enriched[int_field] = int(enriched[int_field].strip())
+                except ValueError:
+                    pass
+
+        # Parse string float representations
+        for float_field in ("spot_check_probability", "verification_tolerance", "relative_discrepancy_threshold", "max_price_per_gflop"):
+            if float_field in enriched and isinstance(enriched[float_field], str):
+                try:
+                    enriched[float_field] = float(enriched[float_field].strip())
                 except ValueError:
                     pass
 
@@ -356,6 +386,11 @@ class ClientConfig(BaseModel):
             "iterative": WorkloadType.ITERATIVE_POWER,
             "power": WorkloadType.ITERATIVE_POWER,
             "power_iteration": WorkloadType.ITERATIVE_POWER,
+            "iterative_power": WorkloadType.ITERATIVE_POWER,
+            "iterativepower": WorkloadType.ITERATIVE_POWER,
+            "power_iter": WorkloadType.ITERATIVE_POWER,
+            "poweriter": WorkloadType.ITERATIVE_POWER,
+            "poweriteration": WorkloadType.ITERATIVE_POWER,
             "batch": WorkloadType.BATCH_STREAM,
             "stream": WorkloadType.BATCH_STREAM,
             "streaming": WorkloadType.BATCH_STREAM,
@@ -447,6 +482,16 @@ class ClientConfig(BaseModel):
         """Alias for grid_cols (column partitions)."""
         return self.grid_cols
 
+    @property
+    def is_iterative_workload(self) -> bool:
+        """Returns True if configured for stateful iterative workloads (ITERATIVE_POWER)."""
+        return self.workload_type == WorkloadType.ITERATIVE_POWER
+
+    @property
+    def is_gemm_workload(self) -> bool:
+        """Returns True if configured for one-shot GEMM workloads (GEMM_ONE_SHOT)."""
+        return self.workload_type == WorkloadType.GEMM_ONE_SHOT
+
     @classmethod
     def load(cls, **kwargs: Any) -> "ClientConfig":
         """Alias constructor resolving environment variables and explicit overrides."""
@@ -482,6 +527,9 @@ class ClientConfig(BaseModel):
             "task_timeout_seconds": 3.0,
             "max_retries": 1,
             "default_tile_size": 256,
+            "lease_ttl_seconds": 60,
+            "spot_check_probability": 0.05,
+            "default_iterations": 10,
         }
         params.update(kwargs)
         return cls(**params)

@@ -3,7 +3,11 @@ matrix-compute-sdk (`matrix_compute`): Production-grade consumer Python library 
 orchestrator for distributed matrix multiplication over decentralized compute nodes.
 """
 
-from .client import MatrixComputeClient, distributed_matmul
+from .client import (
+    MatrixComputeClient,
+    distributed_matmul,
+    distributed_power_iteration,
+)
 from .config import (
     ClientConfig,
     PartitioningStrategy,
@@ -64,6 +68,7 @@ from .orchestrator import (
     ComputeCoordinator,
     CoordinatorState,
     DistributedMatmulCoordinator,
+    IterativeResult,
     JobManifest,
     ParallelTaskScheduler,
     TaskScheduler,
@@ -120,6 +125,7 @@ from .verification import (
     create_fraud_dispute,
     freivalds_verify,
     verify_fraud_proof,
+    verify_iterative_step,
 )
 
 __version__ = "0.1.0"
@@ -129,6 +135,10 @@ __all__ = [
     # Client & High-Level API
     "MatrixComputeClient",
     "distributed_matmul",
+    "distributed_power_iteration",
+    # Stateful & Iterative
+    "IterativeResult",
+    "verify_iterative_step",
     # Configuration
     "ClientConfig",
     "PartitioningStrategy",

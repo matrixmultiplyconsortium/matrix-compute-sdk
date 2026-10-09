@@ -12,10 +12,11 @@ from __future__ import annotations
 from concurrent import futures
 from dataclasses import dataclass, field
 import collections
+import hashlib
 import logging
 import math
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 import numpy as np
@@ -31,14 +32,40 @@ except ImportError:
     from matrix_contracts.schemas.verification import FreivaldsFraudProof
     from matrix_contracts.schemas.relay import WorkerQueryRequest
 
+try:
+    from matrix_contracts.v1 import (
+        LeaseMatrixRequest,
+        LeaseMatrixResponse,
+        IterativeStepRequest,
+        IterativeStepResponse,
+        ReleaseLeaseRequest,
+        ReleaseLeaseResponse,
+        matrix_service_pb2 as pb2,
+    )
+except ImportError:
+    try:
+        from matrix_contracts.proto import (
+            LeaseMatrixRequest,
+            LeaseMatrixResponse,
+            IterativeStepRequest,
+            IterativeStepResponse,
+            ReleaseLeaseRequest,
+            ReleaseLeaseResponse,
+            matrix_service_pb2 as pb2,
+        )
+    except ImportError:
+        pass
+
 from matrix_compute.config import ClientConfig, PartitioningStrategy
-from matrix_compute.crypto.signer import ClientSigner
+from matrix_compute.crypto.signer import ClientSigner, verify_signature
 from matrix_compute.discovery.matchmaker import Matchmaker
-from matrix_compute.discovery.relay_client import DiscoveredWorker, RelayClient
+from matrix_compute.discovery.relay_client import DiscoveredWorker, RelayClient, parse_multiaddr
 from matrix_compute.exceptions import (
     FraudDetectedError,
+    MatrixDimensionError,
     NoWorkersFoundError,
     VerificationFailedError,
+    WorkerSignatureError,
     WorkerUnavailableError,
 )
 from matrix_compute.orchestrator.scheduler import ParallelTaskScheduler
@@ -47,8 +74,9 @@ from matrix_compute.payment.escrow import EscrowManager, EscrowStatus
 from matrix_compute.test_doubles.mock_worker import MockWorkerNode
 from matrix_compute.tiling.assembler import ResultAssembler
 from matrix_compute.tiling.partitioner import MatrixTiler, TileGridPlan, TileTaskPlan
+from matrix_compute.tiling.precision import get_numpy_dtype, normalize_dtype, truncate_to_bf16
 from matrix_compute.verification.fraud_proof import FraudProofBuilder
-from matrix_compute.verification.freivalds import FreivaldsVerifier
+from matrix_compute.verification.freivalds import FreivaldsVerifier, verify_iterative_step
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +110,52 @@ class PipelinedTaskContext:
     escrow: Any
     assigned_pubkey: str
     is_failed_over: bool = False
+
+
+@dataclass
+class IterativeResult:
+    """
+    Execution result of distributed stateful iterative power computation (v_T = A^T v_0).
+    Provides seamless NumPy array compatibility via __array__ protocol.
+    """
+
+    final_vector: np.ndarray
+    iterations_completed: int
+    lease_id: str
+    worker_pubkey: str
+    spot_checks_performed: int
+    spot_checks_passed: int
+    total_compute_time_ms: int
+    bytes_freed: int
+    manifest: Optional[JobManifest] = None
+
+    def __array__(self, dtype: Optional[Any] = None) -> np.ndarray:
+        """Enables direct np.asarray(result) and np.allclose(result, target) evaluation."""
+        return np.asarray(self.final_vector, dtype=dtype)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self.final_vector.shape
+
+    @property
+    def ndim(self) -> int:
+        return self.final_vector.ndim
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self.final_vector.dtype
+
+    def __len__(self) -> int:
+        return len(self.final_vector)
+
+    def __getitem__(self, item: Any) -> Any:
+        return self.final_vector[item]
+
+    def __iter__(self) -> Any:
+        return iter(self.final_vector)
+
+    def copy(self) -> np.ndarray:
+        return self.final_vector.copy()
 
 
 class DistributedMatmulCoordinator:
@@ -740,6 +814,495 @@ class DistributedMatmulCoordinator:
         )
         resp = self.relay_client.query_workers(query_req)
         return resp.matched_workers
+
+    def _verify_step_signature(
+        self,
+        worker_pubkey: str,
+        lease_id: str,
+        step_index: int,
+        res_bytes: bytes,
+        signature: str,
+    ) -> bool:
+        """Validates worker Secp256k1 signature over an iterative step result."""
+        if not worker_pubkey or not signature:
+            return False
+        clean_sig = str(signature).strip().lower()
+        r_hex = hashlib.sha256(res_bytes).hexdigest()
+        r_dig = hashlib.sha256(res_bytes).digest()
+
+        payload1 = f"{lease_id}:{step_index}:{r_hex}".encode("utf-8")
+        payload2 = f"{lease_id}:{step_index}:".encode("utf-8") + r_dig
+
+        for p in (payload1, payload2):
+            if verify_signature(worker_pubkey, hashlib.sha256(p).digest(), clean_sig):
+                return True
+            if verify_signature(worker_pubkey, p, clean_sig):
+                return True
+        return False
+
+    def execute_iterative_power(
+        self,
+        A: np.ndarray,
+        v0: Optional[np.ndarray] = None,
+        iterations: int = 100,
+        dtype: Optional[str] = "fp32",
+        lease_ttl_seconds: Optional[int] = None,
+        spot_check_probability: Optional[float] = None,
+        normalize: bool = False,
+        candidate_workers: Optional[List[Any]] = None,
+        timeout: Optional[float] = None,
+        forced_spot_check_indices: Optional[Set[int]] = None,
+        **kwargs: Any,
+    ) -> IterativeResult:
+        """
+        Executes distributed stateful power iteration v_{iterations} = A^{iterations} v_0
+        using remote VRAM session leasing and probabilistic spot-check Freivalds verification.
+
+        6-Stage Lifecycle:
+          Stage 1: Dimension, finiteness, and precision validation.
+          Stage 2: VRAM matchmaking, GFLOP cost calculation, and L402 HODL escrow lock.
+          Stage 3: Lease acquisition uploading matrix A strictly once.
+          Stage 4: Streaming vector loop t = 0..iterations-1 with Secp256k1 signature validation.
+          Stage 5: Probabilistic Freivalds spot-checking with fraud proof construction and slashing.
+          Stage 6: Explicit ReleaseLease in finally: block and escrow payout settlement.
+        """
+        start_time = time.time()
+        job_id = f"job_power_{uuid.uuid4().hex[:12]}"
+
+        # =====================================================================
+        # Stage 1: Validation of Dimensions, Finiteness, and Dtype Normalization
+        # =====================================================================
+        if not isinstance(A, np.ndarray) or A.ndim != 2:
+            raise MatrixDimensionError(
+                f"Matrix A must be a 2D square numpy array, got {getattr(A, 'ndim', type(A))}D",
+                shape_a=getattr(A, "shape", None),
+            )
+
+        n_rows, n_cols = A.shape
+        if n_rows != n_cols:
+            raise MatrixDimensionError(
+                f"Power iteration requires a square matrix (N x N), got shape {A.shape}",
+                shape_a=A.shape,
+            )
+        n = n_rows
+
+        if int(iterations) < 1:
+            raise ValueError(f"iterations must be a positive integer >= 1, got {iterations}")
+        num_iterations = int(iterations)
+
+        # Initialize or validate initial state vector v_0
+        if v0 is None:
+            v_curr = np.random.uniform(0.1, 1.0, size=(n,)).astype(np.float64)
+            if normalize:
+                v_norm = np.linalg.norm(v_curr)
+                if v_norm > 0:
+                    v_curr = v_curr / v_norm
+        else:
+            if not isinstance(v0, np.ndarray):
+                v_curr = np.asarray(v0)
+            else:
+                v_curr = v0
+
+            if v_curr.ndim == 1:
+                if v_curr.size != n:
+                    raise MatrixDimensionError(
+                        f"Vector v0 length ({v_curr.size}) must match matrix dimension ({n})"
+                    )
+                v_curr = v_curr.copy()
+            elif v_curr.ndim == 2:
+                if v_curr.shape in ((n, 1), (1, n)):
+                    v_curr = v_curr.flatten().copy()
+                else:
+                    raise MatrixDimensionError(
+                        f"Vector v0 shape {v_curr.shape} invalid for dimension {n}"
+                    )
+            else:
+                raise MatrixDimensionError(
+                    f"Vector v0 must be 1D or 2D column vector, got {v_curr.ndim}D"
+                )
+
+        # Finiteness assertion
+        if not (np.all(np.isfinite(A)) and np.all(np.isfinite(v_curr))):
+            raise ValueError("Input matrix A and vector v0 must contain strictly finite values (no NaN or Inf)")
+
+        # Precision normalization
+        norm_dtype = normalize_dtype(dtype, fallback_tensor=A)
+        if norm_dtype == "fp16":
+            matrix_a = A.astype(np.float16)
+            v_curr = v_curr.astype(np.float16)
+        elif norm_dtype == "bf16":
+            matrix_a = truncate_to_bf16(A.astype(np.float32))
+            v_curr = truncate_to_bf16(v_curr.astype(np.float32))
+        elif norm_dtype == "fp64":
+            matrix_a = A.astype(np.float64)
+            v_curr = v_curr.astype(np.float64)
+        else:
+            norm_dtype = "fp32"
+            matrix_a = A.astype(np.float32)
+            v_curr = v_curr.astype(np.float32)
+
+        matrix_a = np.ascontiguousarray(matrix_a)
+        v_curr = np.ascontiguousarray(v_curr)
+
+        # =====================================================================
+        # Stage 2: Matchmaking Worker Candidate & Lock L402 Escrow
+        # =====================================================================
+        item_size = 4 if norm_dtype in ("fp32", "bf16") else (2 if norm_dtype == "fp16" else 8)
+        matrix_vram_bytes = n * n * item_size
+        required_vram_mb = max(
+            int(math.ceil((matrix_vram_bytes * 2.0) / (1024 * 1024))) + 64,
+            self.config.min_worker_vram_mb,
+        )
+
+        candidates = candidate_workers or kwargs.get("candidates")
+        if not candidates:
+            candidates = self._discover_and_match_workers(required_slots=1)
+
+        if not candidates:
+            raise NoWorkersFoundError(
+                "No compute workers found matching criteria for stateful lease",
+                required_vram_mb=required_vram_mb,
+                max_price_per_gflop=self.config.max_price_per_gflop,
+                available_count=0,
+            )
+
+        assigned_worker = candidates[0]
+        assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
+        worker_endpoint = getattr(
+            assigned_worker,
+            "p2p_multiaddr",
+            getattr(assigned_worker, "multiaddr", getattr(assigned_worker, "target", "127.0.0.1:50051")),
+        )
+        sats_rate = getattr(assigned_worker, "sats_per_gflop", self.config.max_price_per_gflop)
+        worker_ln = getattr(
+            assigned_worker,
+            "lightning_routing_pubkey",
+            getattr(assigned_worker, "lightning_address", "worker@node"),
+        )
+
+        # Cost computation: 2 * N^2 * iterations FLOPs
+        total_flops = 2.0 * float(n) * float(n) * float(num_iterations)
+        total_gflops = total_flops / 1e9
+        total_sats = max(int(math.ceil(total_gflops * sats_rate)), 10)
+
+        effective_ttl = int(lease_ttl_seconds or getattr(self.config, "lease_ttl_seconds", 3600))
+        escrow_timeout = float(effective_ttl + 300)
+        task_id = f"task_{job_id}"
+
+        # Provision and hold HODL escrow
+        try:
+            escrow = self.escrow_manager.create_escrow(
+                task_id=task_id,
+                total_sats=total_sats,
+                worker_lightning_addr=worker_ln,
+                timeout_seconds=escrow_timeout,
+                max_gflops=max(total_gflops, 1.0),
+            )
+        except TypeError:
+            escrow = self.escrow_manager.create_escrow(
+                task_id=task_id,
+                worker_pubkey=assigned_pubkey,
+                worker_lightning_address=worker_ln,
+                gflops=max(total_gflops, 1.0),
+                sats_rate=sats_rate,
+            )
+
+        if hasattr(self.escrow_manager, "hold_escrow"):
+            self.escrow_manager.hold_escrow(task_id)
+
+        auth_header = (
+            escrow.get_auth_header()
+            if hasattr(escrow, "get_auth_header")
+            else f"L402 {getattr(escrow, 'macaroon', '')}:{getattr(escrow, 'payment_hash', '')}"
+        )
+        eff_timeout = timeout if timeout is not None else self.config.task_timeout_seconds
+
+        # =====================================================================
+        # Stage 3: Lease Matrix Uploading Matrix A Strictly Once
+        # =====================================================================
+        lease_id = f"lease_{uuid.uuid4().hex[:12]}"
+        matrix_bytes = matrix_a.tobytes()
+
+        # Identify if worker is a mock worker with an in-memory servicer
+        matching_mock_worker = None
+        for mw in self.mock_workers:
+            mw_pub = getattr(mw, "pubkey", "")
+            mw_endpoint = getattr(mw, "multiaddr", getattr(mw, "target", ""))
+            if (assigned_pubkey and mw_pub == assigned_pubkey) or (
+                worker_endpoint and (worker_endpoint == mw_endpoint or worker_endpoint == getattr(mw, "target", ""))
+            ):
+                matching_mock_worker = mw
+                break
+
+        use_mock_servicer = matching_mock_worker is not None and hasattr(matching_mock_worker, "servicer")
+
+        if use_mock_servicer:
+            lease_req = LeaseMatrixRequest(
+                lease_id=lease_id,
+                rows=n,
+                cols=n,
+                dtype=norm_dtype,
+                matrix_bytes=matrix_bytes,
+                ttl_seconds=effective_ttl,
+            )
+            lease_resp = matching_mock_worker.servicer.LeaseMatrix(lease_req)
+        else:
+            try:
+                lease_resp = self.dispatcher.lease_matrix(
+                    worker_or_target=worker_endpoint,
+                    lease_id=lease_id,
+                    matrix_a=matrix_a,
+                    dtype=norm_dtype,
+                    ttl_seconds=effective_ttl,
+                    auth_header=auth_header,
+                    timeout=eff_timeout,
+                )
+            except Exception as d_err:
+                if hasattr(self.escrow_manager, "abort_and_refund"):
+                    self.escrow_manager.abort_and_refund(task_id, reason=str(d_err))
+                raise WorkerUnavailableError(f"Lease rejected: {d_err}") from d_err
+
+        if not getattr(lease_resp, "is_accepted", True):
+            err_msg = getattr(lease_resp, "message", "Worker rejected matrix lease request")
+            if hasattr(self.escrow_manager, "abort_and_refund"):
+                self.escrow_manager.abort_and_refund(task_id, reason=err_msg)
+            raise WorkerUnavailableError(f"Lease rejected: {err_msg}")
+
+        actual_worker_pubkey = assigned_pubkey or getattr(lease_resp, "worker_pubkey", "")
+
+        # =====================================================================
+        # Stage 4 & 5: Streaming Iteration Loop & Freivalds Spot-Checking
+        # =====================================================================
+        spot_prob = (
+            spot_check_probability
+            if spot_check_probability is not None
+            else getattr(self.config, "spot_check_probability", 0.05)
+        )
+        forced_checks = forced_spot_check_indices or set()
+
+        spot_checks_performed = 0
+        spot_checks_passed = 0
+        total_compute_ms = 0
+        bytes_freed = 0
+        execution_successful = False
+
+        try:
+            np_res_dtype = (
+                np.float32
+                if norm_dtype in ("fp32", "bf16")
+                else (np.float16 if norm_dtype == "fp16" else np.float64)
+            )
+
+            for t in range(num_iterations):
+                if use_mock_servicer:
+                    v_t_bytes = v_curr.tobytes()
+                    step_req = IterativeStepRequest(
+                        lease_id=lease_id,
+                        step_index=t,
+                        vector_bytes=v_t_bytes,
+                        vector_length=n,
+                        dtype=norm_dtype,
+                    )
+                    step_resp = matching_mock_worker.servicer.StepIterative(step_req)
+                    res_bytes = step_resp.result_vector_bytes
+                    v_next = np.frombuffer(res_bytes, dtype=np_res_dtype).reshape((n,))
+                    step_sig = getattr(step_resp, "worker_signature", "")
+                    total_compute_ms += int(getattr(step_resp, "execution_time_ms", 1))
+                else:
+                    step_resp = self.dispatcher.step_iterative(
+                        worker_or_target=worker_endpoint,
+                        lease_id=lease_id,
+                        step_index=t,
+                        vector_v=v_curr,
+                        dtype=norm_dtype,
+                        auth_header=auth_header,
+                        worker_pubkey=actual_worker_pubkey,
+                        timeout=eff_timeout,
+                    )
+                    res_bytes = step_resp.result_vector_bytes
+                    v_next = getattr(
+                        step_resp, "result_vec", np.frombuffer(res_bytes, dtype=np_res_dtype).reshape((n,))
+                    )
+                    step_sig = getattr(step_resp, "worker_signature", "")
+                    total_compute_ms += int(getattr(step_resp, "execution_time_ms", 1))
+
+                if norm_dtype == "bf16":
+                    v_next = truncate_to_bf16(v_next)
+                elif norm_dtype == "fp16":
+                    v_next = v_next.astype(np.float16)
+
+                # Step 4.3: Verify Secp256k1 signature
+                if actual_worker_pubkey:
+                    if not step_sig or not str(step_sig).strip():
+                        if hasattr(self.escrow_manager, "abort_and_refund"):
+                            self.escrow_manager.abort_and_refund(task_id, reason=f"missing_signature_step_{t}")
+                        raise WorkerSignatureError(
+                            f"Worker omitted required Secp256k1 signature on iterative step {t}",
+                            task_id=f"{lease_id}_step_{t}",
+                            worker_pubkey=actual_worker_pubkey,
+                            signature="",
+                        )
+                    sig_valid = self._verify_step_signature(
+                        worker_pubkey=actual_worker_pubkey,
+                        lease_id=lease_id,
+                        step_index=t,
+                        res_bytes=res_bytes,
+                        signature=step_sig,
+                    )
+                    if not sig_valid:
+                        if hasattr(self.escrow_manager, "abort_and_refund"):
+                            self.escrow_manager.abort_and_refund(task_id, reason=f"bad_signature_step_{t}")
+                        raise WorkerSignatureError(
+                            f"Worker Secp256k1 signature validation failed on iterative step {t}",
+                            task_id=f"{lease_id}_step_{t}",
+                            worker_pubkey=actual_worker_pubkey,
+                            signature=step_sig,
+                        )
+
+                # Step 5: Probabilistic Spot-Check Freivalds Verification
+                should_spot_check = (t in forced_checks) or (spot_prob >= 1.0) or (np.random.random() < spot_prob)
+                if should_spot_check:
+                    spot_checks_performed += 1
+                    is_valid, discrepancy, bound, proof_data = verify_iterative_step(
+                        A=matrix_a,
+                        v_t=v_curr,
+                        v_next=v_next,
+                        dtype=norm_dtype,
+                    )
+
+                    if is_valid:
+                        spot_checks_passed += 1
+                    else:
+                        # Computational Fraud Detected!
+                        r_hash = hashlib.sha256(res_bytes).hexdigest()
+                        eff_proof_bound = bound if discrepancy > bound else max(discrepancy * 0.5, 0.0)
+                        fraud_proof = FreivaldsFraudProof(
+                            task_id=f"{lease_id}_step_{t}",
+                            worker_pubkey=actual_worker_pubkey,
+                            dimension_m=n,
+                            dimension_k=n,
+                            dimension_n=1,
+                            dtype=norm_dtype,
+                            matrix_a_hash=hashlib.sha256(matrix_a.tobytes()).hexdigest(),
+                            matrix_b_hash=hashlib.sha256(v_curr.tobytes()).hexdigest(),
+                            invalid_result_c_hash=r_hash,
+                            random_vector_r=[1],
+                            vector_br=v_curr.flatten().astype(float).tolist(),
+                            vector_abr=np.matmul(matrix_a.astype(np.float64), v_curr.flatten().astype(np.float64)).flatten().tolist(),
+                            vector_cr=v_next.flatten().astype(float).tolist(),
+                            epsilon_tolerance=eff_proof_bound,
+                            max_observed_discrepancy=discrepancy,
+                            worker_signature_on_result=step_sig or ("00" * 64),
+                            consumer_pubkey=self.signer.get_pubkey_hex(),
+                        )
+
+                        if hasattr(self.escrow_manager, "abort_and_refund"):
+                            try:
+                                self.escrow_manager.abort_and_refund(
+                                    task_id=task_id,
+                                    reason=f"fraud_detected_step_{t}",
+                                    fraud_proof=fraud_proof,
+                                )
+                            except TypeError:
+                                self.escrow_manager.abort_and_refund(
+                                    task_id=task_id,
+                                    reason=f"fraud_detected_step_{t}",
+                                )
+                        self._submit_fraud_slashing(fraud_proof)
+
+                        raise FraudDetectedError(
+                            f"Freivalds verification failed on iterative step {t}: "
+                            f"discrepancy {discrepancy:.6e} > bound {bound:.6e}",
+                            task_id=f"{lease_id}_step_{t}",
+                            worker_pubkey=actual_worker_pubkey,
+                            fraud_proof=fraud_proof,
+                        )
+
+                # Optional L2 normalization between steps
+                if normalize:
+                    v_norm = np.linalg.norm(v_next)
+                    if v_norm > 0:
+                        v_next = v_next / v_norm
+
+                v_curr = v_next.copy()
+
+            execution_successful = True
+
+        finally:
+            # =================================================================
+            # Stage 6: Explicit ReleaseLease & Cleanup in finally: Block
+            # =================================================================
+            try:
+                if use_mock_servicer:
+                    rel_req = ReleaseLeaseRequest(
+                        lease_id=lease_id,
+                        consumer_pubkey=self.signer.get_pubkey_hex(),
+                        reason="completed" if execution_successful else "aborted",
+                    )
+                    rel_resp = matching_mock_worker.servicer.ReleaseLease(rel_req)
+                    bytes_freed = int(getattr(rel_resp, "bytes_freed", 0))
+                else:
+                    rel_resp = self.dispatcher.release_lease(
+                        worker_or_target=worker_endpoint,
+                        lease_id=lease_id,
+                        reason="completed" if execution_successful else "aborted",
+                        consumer_pubkey=self.signer.get_pubkey_hex(),
+                        timeout=eff_timeout,
+                    )
+                    bytes_freed = int(getattr(rel_resp, "bytes_freed", 0))
+            except Exception as rel_err:
+                logger.warning("Failed to release matrix lease '%s': %s", lease_id, rel_err)
+
+            # Mid-loop failure refund guard:
+            if not execution_successful:
+                try:
+                    if hasattr(self.escrow_manager, "get_escrow"):
+                        escrow = self.escrow_manager.get_escrow(task_id)
+                        if escrow and not getattr(escrow, "is_terminal", False):
+                            if hasattr(self.escrow_manager, "abort_and_refund"):
+                                self.escrow_manager.abort_and_refund(task_id, reason="iteration_loop_failed")
+                    elif hasattr(self.escrow_manager, "abort_and_refund"):
+                        self.escrow_manager.abort_and_refund(task_id, reason="iteration_loop_failed")
+                except Exception as esc_err:
+                    logger.warning("Failed to refund escrow '%s' on iteration failure: %s", task_id, esc_err)
+
+        # On success: Settle escrow payout
+        if execution_successful:
+            if hasattr(self.escrow_manager, "release_payout"):
+                self.escrow_manager.release_payout(task_id)
+            elif hasattr(self.escrow_manager, "settle_payout"):
+                self.escrow_manager.settle_payout(task_id)
+
+        elapsed = time.time() - start_time
+        manifest = JobManifest(
+            job_id=job_id,
+            m=n,
+            k=n,
+            n=1,
+            dtype=norm_dtype,
+            tile_size=n,
+            total_tasks=num_iterations,
+            completed_tasks=num_iterations,
+            total_cost_sats=total_sats,
+            elapsed_time_sec=elapsed,
+            task_ids=[f"{lease_id}_step_{t}" for t in range(num_iterations)],
+            peak_concurrency=1,
+        )
+        self._last_manifest = manifest
+
+        return IterativeResult(
+            final_vector=v_curr,
+            iterations_completed=num_iterations,
+            lease_id=lease_id,
+            worker_pubkey=actual_worker_pubkey,
+            spot_checks_performed=spot_checks_performed,
+            spot_checks_passed=spot_checks_passed,
+            total_compute_time_ms=total_compute_ms,
+            bytes_freed=bytes_freed,
+            manifest=manifest,
+        )
+
+    power_iteration = execute_iterative_power
 
     def close(self) -> None:
         """Closes internal subsystems."""

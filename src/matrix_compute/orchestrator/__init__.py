@@ -4,6 +4,7 @@ from .coordinator import (
     ComputeCoordinator,
     CoordinatorState,
     DistributedMatmulCoordinator,
+    IterativeResult,
     JobManifest,
 )
 from .scheduler import (
@@ -16,6 +17,7 @@ __all__ = [
     "DistributedMatmulCoordinator",
     "ComputeCoordinator",
     "CoordinatorState",
+    "IterativeResult",
     "JobManifest",
     "ParallelTaskScheduler",
     "TaskScheduler",

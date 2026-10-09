@@ -31,9 +31,12 @@ from matrix_compute.crypto.attestation_verifier import AttestationVerifier
 from matrix_compute.crypto.session import (
     CryptoSessionError,
     DecryptionError,
+    EncryptedPayload,
     KeyExchangeError,
     SecurityPolicyViolationError,
     SessionContext,
+    aes_gcm_decrypt,
+    aes_gcm_encrypt,
     decrypt_result,
     derive_session_keys,
     encrypt_chunk,
@@ -71,6 +74,49 @@ class DispatchedTileResult:
     worker_signature: str
     execution_time_ms: int
     raw_result: pb2.TileResult
+
+
+@dataclass
+class IterativeSessionContext:
+    """Session context tracking state for an active matrix lease."""
+
+    lease_id: str
+    rows: int
+    cols: int
+    dtype: str
+    is_confidential: bool = False
+    client_ephemeral_priv: Optional[Any] = None
+    client_ephemeral_pub_bytes: bytes = b""
+    worker_ephemeral_pub_bytes: bytes = b""
+    k_c2w: Optional[bytes] = None
+    k_w2c: Optional[bytes] = None
+    expires_at_unix_ms: int = 0
+
+
+class IterativeStepResponseWrapper:
+    """Wrapper around IterativeStepResponse that supports both direct attribute access and tuple unpacking."""
+
+    def __init__(self, response: pb2.IterativeStepResponse, result_vec: np.ndarray) -> None:
+        self._response = response
+        self._result_vec = result_vec
+
+    @property
+    def result_vec(self) -> np.ndarray:
+        return self._result_vec
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self._result_vec
+        yield self._response
+
+    def __getitem__(self, index: int) -> Any:
+        if index == 0:
+            return self._result_vec
+        elif index == 1:
+            return self._response
+        raise IndexError(f"Index out of range: {index}")
 
 
 class GrpcTaskDispatcher:
@@ -125,6 +171,7 @@ class GrpcTaskDispatcher:
 
         self.attestation_verifier = attestation_verifier
         self._sessions: Dict[str, SessionContext] = {}
+        self._iterative_sessions: Dict[str, IterativeSessionContext] = {}
         self._sessions_lock = threading.Lock()
 
     def request_tile_task(
@@ -722,6 +769,336 @@ class GrpcTaskDispatcher:
                     return True
             except Exception as ex:
                 logger.debug("Fallback composite signature verification error: %s", ex)
+
+        return False
+
+    def lease_matrix(
+        self,
+        worker_or_target: Union[str, Any],
+        lease_id: str,
+        matrix_a: np.ndarray,
+        dtype: str = "fp32",
+        ttl_seconds: Optional[int] = None,
+        auth_header: Optional[str] = None,
+        worker_pubkey: str = "",
+        timeout: Optional[float] = None,
+        require_confidential_compute: Optional[bool] = None,
+    ) -> pb2.LeaseMatrixResponse:
+        """
+        Requests remote GPU VRAM session lease and uploads matrix A strictly once.
+        """
+        target = parse_multiaddr(worker_or_target)
+        stub = self.channel_pool.get_stub(target)
+        target_dtype = normalize_dtype(dtype)
+        np_dtype = get_numpy_dtype(target_dtype)
+
+        rows, cols = matrix_a.shape
+        eff_ttl = int(ttl_seconds) if ttl_seconds is not None and ttl_seconds > 0 else 3600
+
+        is_confidential = (
+            self.require_confidential_compute
+            if require_confidential_compute is None
+            else require_confidential_compute
+        )
+
+        client_priv = None
+        client_pub_bytes = b""
+        if is_confidential:
+            client_priv, client_pub_bytes = generate_ephemeral_keypair()
+
+        # Serialize contiguous matrix bytes
+        matrix_bytes = np.ascontiguousarray(matrix_a, dtype=np_dtype).tobytes()
+
+        req = pb2.LeaseMatrixRequest(
+            lease_id=str(lease_id).strip(),
+            rows=int(rows),
+            cols=int(cols),
+            dtype=target_dtype,
+            matrix_bytes=matrix_bytes,
+            ttl_seconds=int(eff_ttl),
+            require_confidential_compute=bool(is_confidential),
+            client_ephemeral_pubkey=client_pub_bytes,
+        )
+
+        metadata: List[Tuple[str, str]] = [("x-lease-id", str(lease_id).strip())]
+        if auth_header:
+            metadata.append(("authorization", auth_header.strip()))
+
+        eff_timeout = timeout if timeout is not None else self.task_timeout
+
+        try:
+            response = stub.LeaseMatrix(req, metadata=metadata, timeout=eff_timeout)
+        except grpc.RpcError as rpc_err:
+            self._handle_rpc_error(
+                rpc_err, lease_id, "LeaseMatrix", worker_pubkey=worker_pubkey, multiaddr=target
+            )
+
+        if not response.is_accepted:
+            msg = response.message or "Worker rejected matrix lease"
+            raise WorkerTaskRejectedError(
+                f"Worker rejected matrix lease '{lease_id}': {msg}",
+                task_id=lease_id,
+                worker_pubkey=worker_pubkey or getattr(response, "worker_pubkey", ""),
+                reason=msg,
+            )
+
+        k_c2w = None
+        k_w2c = None
+        if is_confidential:
+            if not response.worker_ephemeral_pubkey or len(response.worker_ephemeral_pubkey) != 32:
+                raise KeyExchangeError(
+                    f"Worker did not provide 32-byte ephemeral public key for lease '{lease_id}'"
+                )
+            assert client_priv is not None
+            salt = hashlib.sha256(f"iterative:{lease_id}".encode("utf-8")).digest()
+            keys = derive_session_keys(
+                secret_or_priv=client_priv,
+                nonce_c_or_pub=response.worker_ephemeral_pubkey,
+                nonce_w_or_salt=salt,
+            )
+            k_c2w = keys.k_c2w
+            k_w2c = keys.k_w2c
+
+        session_ctx = IterativeSessionContext(
+            lease_id=lease_id,
+            rows=rows,
+            cols=cols,
+            dtype=target_dtype,
+            is_confidential=is_confidential,
+            client_ephemeral_priv=client_priv,
+            client_ephemeral_pub_bytes=client_pub_bytes,
+            worker_ephemeral_pub_bytes=response.worker_ephemeral_pubkey,
+            k_c2w=k_c2w,
+            k_w2c=k_w2c,
+            expires_at_unix_ms=int(response.expires_at_unix_ms),
+        )
+
+        with self._sessions_lock:
+            self._iterative_sessions[lease_id] = session_ctx
+
+        return response
+
+    def step_iterative(
+        self,
+        worker_or_target: Union[str, Any],
+        lease_id: str,
+        step_index: int,
+        vector_v: np.ndarray,
+        dtype: str = "fp32",
+        auth_header: Optional[str] = None,
+        worker_pubkey: str = "",
+        timeout: Optional[float] = None,
+    ) -> IterativeStepResponseWrapper:
+        """
+        Executes a single remote matrix-vector multiplication step: v_{t+1} = A * v_t.
+        """
+        target = parse_multiaddr(worker_or_target)
+        stub = self.channel_pool.get_stub(target)
+        target_dtype = normalize_dtype(dtype)
+        np_dtype = get_numpy_dtype(target_dtype)
+        bytes_per_elem = get_bytes_per_element(target_dtype)
+
+        # Ensure contiguous 1D array
+        vec_1d = np.ascontiguousarray(vector_v.flatten(), dtype=np_dtype)
+        vector_len = vec_1d.size
+        raw_vec_bytes = vec_1d.tobytes()
+
+        with self._sessions_lock:
+            session = self._iterative_sessions.get(lease_id)
+
+        is_encrypted = False
+        iv = b""
+        tag = b""
+        payload_bytes = raw_vec_bytes
+
+        if session is not None and session.is_confidential and session.k_c2w is not None:
+            step_aad = f"{lease_id}:step:{step_index}".encode("utf-8")
+            enc = aes_gcm_encrypt(
+                key=session.k_c2w,
+                plaintext=raw_vec_bytes,
+                aad=step_aad,
+            )
+            payload_bytes = enc.ciphertext
+            iv = enc.iv
+            tag = enc.tag
+            is_encrypted = True
+
+        req = pb2.IterativeStepRequest(
+            lease_id=str(lease_id).strip(),
+            step_index=int(step_index),
+            vector_bytes=payload_bytes,
+            vector_length=int(vector_len),
+            dtype=target_dtype,
+            is_encrypted=is_encrypted,
+            iv=iv,
+            tag=tag,
+        )
+
+        metadata: List[Tuple[str, str]] = [
+            ("x-lease-id", str(lease_id).strip()),
+            ("x-step-index", str(step_index)),
+        ]
+        if auth_header:
+            metadata.append(("authorization", auth_header.strip()))
+
+        eff_timeout = timeout if timeout is not None else self.task_timeout
+
+        try:
+            response = stub.StepIterative(req, metadata=metadata, timeout=eff_timeout)
+        except grpc.RpcError as rpc_err:
+            self._handle_rpc_error(
+                rpc_err, lease_id, "StepIterative", worker_pubkey=worker_pubkey, multiaddr=target
+            )
+
+        # Validate step indices and lease_id
+        if str(response.lease_id).strip() != str(lease_id).strip():
+            raise TaskDispatchError(
+                f"Worker returned mismatched lease_id: expected {lease_id}, got {response.lease_id}",
+                task_id=lease_id,
+                returned_task_id=response.lease_id,
+            )
+
+        if response.step_index != step_index:
+            raise StreamingError(
+                f"Worker returned mismatched step_index: expected {step_index}, got {response.step_index}"
+            )
+
+        # Decrypt payload if confidential
+        if session is not None and session.is_confidential:
+            if not response.is_encrypted:
+                raise SecurityPolicyViolationError(
+                    f"Confidential compute enabled: worker returned unencrypted step response for lease '{lease_id}'",
+                    task_id=lease_id,
+                )
+            if session.k_w2c is None:
+                raise DecryptionError(
+                    f"No inbound session key established for lease '{lease_id}'",
+                    task_id=lease_id,
+                )
+            step_resp_aad = f"{lease_id}:step:{step_index}".encode("utf-8")
+            decrypted_bytes = aes_gcm_decrypt(
+                key=session.k_w2c,
+                iv=response.iv,
+                ciphertext=response.result_vector_bytes,
+                tag=response.tag,
+                aad=step_resp_aad,
+                fallback_aads=[b"", None],
+            )
+        else:
+            if response.is_encrypted:
+                raise DecryptionError(
+                    f"Unexpected encrypted response for unencrypted lease '{lease_id}'",
+                    task_id=lease_id,
+                )
+            decrypted_bytes = response.result_vector_bytes
+
+        # Validate byte count
+        expected_bytes = response.vector_length * bytes_per_elem
+        if len(decrypted_bytes) != expected_bytes:
+            raise StreamingError(
+                f"Worker returned vector byte count {len(decrypted_bytes)} != expected {expected_bytes} (length={response.vector_length})"
+            )
+
+        # Secp256k1 Signature Verification
+        if worker_pubkey:
+            if not response.worker_signature or not str(response.worker_signature).strip():
+                raise WorkerSignatureError(
+                    f"Worker omitted required Secp256k1 signature on iterative step {step_index} of lease '{lease_id}'",
+                    task_id=lease_id,
+                    worker_pubkey=worker_pubkey,
+                    signature="",
+                )
+            sig_valid = self._verify_iterative_step_signature(
+                worker_pubkey=worker_pubkey,
+                lease_id=lease_id,
+                step_index=step_index,
+                result_bytes=decrypted_bytes,
+                signature=response.worker_signature,
+            )
+            if not sig_valid:
+                raise WorkerSignatureError(
+                    f"Worker signature verification failed on iterative step {step_index} of lease '{lease_id}'",
+                    task_id=lease_id,
+                    worker_pubkey=worker_pubkey,
+                    signature=response.worker_signature,
+                )
+
+        result_vec = np.frombuffer(decrypted_bytes, dtype=np_dtype)
+        return IterativeStepResponseWrapper(response=response, result_vec=result_vec)
+
+    def release_lease(
+        self,
+        worker_or_target: Union[str, Any],
+        lease_id: str,
+        reason: str = "completed",
+        consumer_pubkey: Optional[str] = None,
+        auth_header: Optional[str] = None,
+        worker_pubkey: str = "",
+        timeout: Optional[float] = None,
+    ) -> pb2.ReleaseLeaseResponse:
+        """
+        Explicitly releases remote VRAM matrix lease and zeroizes memory.
+        """
+        target = parse_multiaddr(worker_or_target)
+        stub = self.channel_pool.get_stub(target)
+
+        with self._sessions_lock:
+            self._iterative_sessions.pop(lease_id, None)
+
+        pubkey = consumer_pubkey or self.consumer_pubkey
+
+        req = pb2.ReleaseLeaseRequest(
+            lease_id=str(lease_id).strip(),
+            consumer_pubkey=str(pubkey).strip(),
+            reason=str(reason).strip(),
+        )
+
+        metadata: List[Tuple[str, str]] = [("x-lease-id", str(lease_id).strip())]
+        if auth_header:
+            metadata.append(("authorization", auth_header.strip()))
+
+        eff_timeout = timeout if timeout is not None else self.connect_timeout
+
+        try:
+            response = stub.ReleaseLease(req, metadata=metadata, timeout=eff_timeout)
+        except grpc.RpcError as rpc_err:
+            self._handle_rpc_error(
+                rpc_err, lease_id, "ReleaseLease", worker_pubkey=worker_pubkey, multiaddr=target
+            )
+
+        return response
+
+    def _verify_iterative_step_signature(
+        self,
+        worker_pubkey: str,
+        lease_id: str,
+        step_index: int,
+        result_bytes: bytes,
+        signature: str,
+    ) -> bool:
+        """
+        Validates worker Secp256k1 signature over an iterative step result.
+        """
+        if not worker_pubkey or not signature:
+            return False
+
+        clean_sig = str(signature).strip().lower()
+        r_hash_hex = hashlib.sha256(result_bytes).hexdigest()
+        r_hash_digest = hashlib.sha256(result_bytes).digest()
+
+        # Format 1: Canonical payload with hex hash
+        payload1 = f"{lease_id}:{step_index}:{r_hash_hex}".encode("utf-8")
+        if verify_signature(worker_pubkey, hashlib.sha256(payload1).digest(), clean_sig):
+            return True
+        if verify_signature(worker_pubkey, payload1, clean_sig):
+            return True
+
+        # Format 2: Payload with binary hash digest
+        payload2 = f"{lease_id}:{step_index}:".encode("utf-8") + r_hash_digest
+        if verify_signature(worker_pubkey, hashlib.sha256(payload2).digest(), clean_sig):
+            return True
+        if verify_signature(worker_pubkey, payload2, clean_sig):
+            return True
 
         return False
 

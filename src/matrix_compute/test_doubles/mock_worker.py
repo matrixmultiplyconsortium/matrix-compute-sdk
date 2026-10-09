@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 from concurrent import futures
 import hashlib
 import hmac
@@ -130,6 +131,54 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         self.override_result_task_id: Optional[str] = None
         self.tamper_task_ids: Set[str] = set()
         self.tamper_on_task_count: Optional[int] = None
+
+        # Phase 3: Stateful Iterative Pinned Tensor Sessions
+        self._pinned_sessions: Dict[str, Dict[str, Any]] = {}
+        self.matrix_upload_counts: Dict[str, int] = collections.defaultdict(int)
+        self.recorded_leases: List[str] = []
+        self.recorded_steps: List[Tuple[str, int]] = []
+        self.recorded_releases: List[str] = []
+
+        # Fault injection hooks for Phase 3
+        self.tamper_step_index: Optional[int] = None
+        self.tamper_step_indices: Set[int] = set()
+        self.tamper_step_perturbation: float = 5.0
+        self.tamper_step_signature: bool = False
+        self.reject_lease: bool = False
+        self.lease_reject_message: str = "Worker VRAM capacity exhausted"
+        self.expire_lease_early: bool = False
+        self.expire_lease_after_step: Optional[int] = None
+        self.delay_step_seconds: float = 0.0
+
+        # Stats for iterative leases
+        self.lease_calls: int = 0
+        self.step_calls: int = 0
+        self.release_calls: int = 0
+        self.uploaded_bytes_total: int = 0
+
+    @property
+    def tamper_step_iteration(self) -> Optional[int]:
+        return self.tamper_step_index
+
+    @tamper_step_iteration.setter
+    def tamper_step_iteration(self, val: Optional[int]) -> None:
+        self.tamper_step_index = val
+
+    @property
+    def reject_lease_message(self) -> str:
+        return self.lease_reject_message
+
+    @reject_lease_message.setter
+    def reject_lease_message(self, val: str) -> None:
+        self.lease_reject_message = val
+
+    @property
+    def step_delay_seconds(self) -> float:
+        return self.delay_step_seconds
+
+    @step_delay_seconds.setter
+    def step_delay_seconds(self, val: float) -> None:
+        self.delay_step_seconds = val
 
     def RequestTileTask(
         self,
@@ -458,6 +507,243 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
             with self._lock:
                 self._task_metadata.pop(task_id, None)
 
+    def LeaseMatrix(
+        self,
+        request: pb2.LeaseMatrixRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.LeaseMatrixResponse:
+        """
+        Pins matrix A in memory across iterative steps.
+        Enforces dimension, dtype, and TTL metadata.
+        """
+        lease_id = str(request.lease_id).strip()
+        if not lease_id:
+            msg = "lease_id must not be empty"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        with self._lock:
+            self.lease_calls += 1
+
+        if self.reject_lease:
+            msg = self.lease_reject_message or "Worker rejected lease"
+            if context:
+                context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, msg)
+            return pb2.LeaseMatrixResponse(
+                lease_id=lease_id,
+                is_accepted=False,
+                expires_at_unix_ms=0,
+                worker_pubkey=self.signer.get_pubkey_hex(),
+                message=msg,
+            )
+
+        rows = int(request.rows)
+        cols = int(request.cols)
+        dtype = str(request.dtype).lower().strip() or "fp32"
+        raw_bytes = request.matrix_bytes or b""
+        ttl_seconds = float(request.ttl_seconds) if request.ttl_seconds > 0 else 3600.0
+
+        np_dtype = np.float32 if dtype in ("fp32", "bf16") else (np.float16 if dtype == "fp16" else np.float64)
+        bytes_per_elem = 4 if dtype in ("fp32", "bf16") else (2 if dtype == "fp16" else 8)
+        expected_bytes = rows * cols * bytes_per_elem
+
+        if len(raw_bytes) != expected_bytes:
+            msg = f"Payload size mismatch: expected {expected_bytes} bytes for {rows}x{cols} ({dtype}), got {len(raw_bytes)} bytes"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        matrix_arr = np.frombuffer(raw_bytes, dtype=np_dtype).reshape((rows, cols)).copy()
+        if dtype == "bf16":
+            u32_view = matrix_arr.view(np.uint32)
+            u32_masked = u32_view & 0xFFFF0000
+            matrix_arr = u32_masked.view(np.float32)
+
+        now = time.time()
+        expires_at = now + ttl_seconds
+        expires_at_unix_ms = int(expires_at * 1000)
+
+        with self._lock:
+            self._pinned_sessions[lease_id] = {
+                "matrix": matrix_arr,
+                "rows": rows,
+                "cols": cols,
+                "dtype": dtype,
+                "ttl_seconds": ttl_seconds,
+                "created_at": now,
+                "expires_at": expires_at,
+                "expires_at_unix_ms": expires_at_unix_ms,
+                "memory_bytes": int(matrix_arr.nbytes),
+                "step_count": 0,
+                "is_zeroized": False,
+            }
+            self.matrix_upload_counts[lease_id] += 1
+            self.uploaded_bytes_total += len(raw_bytes)
+            self.recorded_leases.append(lease_id)
+
+        return pb2.LeaseMatrixResponse(
+            lease_id=lease_id,
+            is_accepted=True,
+            expires_at_unix_ms=expires_at_unix_ms,
+            worker_pubkey=self.signer.get_pubkey_hex(),
+            message=f"Lease accepted for {rows}x{cols} ({dtype})",
+        )
+
+    def StepIterative(
+        self,
+        request: pb2.IterativeStepRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.IterativeStepResponse:
+        """
+        Executes single matrix-vector multiplication step v_{t+1} = A * v_t
+        using the pinned matrix tensor. Signs result with Secp256k1 key.
+        """
+        lease_id = str(request.lease_id).strip()
+        step_index = int(request.step_index)
+
+        if not lease_id:
+            msg = "lease_id must not be empty"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        with self._lock:
+            self.step_calls += 1
+            session = self._pinned_sessions.get(lease_id)
+
+        if session is None or session.get("is_zeroized"):
+            msg = f"Active lease '{lease_id}' not found or already released"
+            if context:
+                context.abort(grpc.StatusCode.NOT_FOUND, msg)
+            raise KeyError(msg)
+
+        # Expiration check
+        now = time.time()
+        if (
+            self.expire_lease_early
+            or now > session["expires_at"]
+            or (self.expire_lease_after_step is not None and session["step_count"] >= self.expire_lease_after_step)
+        ):
+            with self._lock:
+                self._pinned_sessions.pop(lease_id, None)
+            msg = f"Lease '{lease_id}' has expired"
+            if context:
+                context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, msg)
+            raise RuntimeError(msg)
+
+        if self.delay_step_seconds > 0:
+            time.sleep(self.delay_step_seconds)
+
+        cols = session["cols"]
+        rows = session["rows"]
+        dtype = session["dtype"]
+        matrix_a = session["matrix"]
+
+        if request.vector_length and int(request.vector_length) != cols:
+            msg = f"Vector length mismatch: matrix cols {cols} != request vector_length {request.vector_length}"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        np_dtype = np.float32 if dtype in ("fp32", "bf16") else (np.float16 if dtype == "fp16" else np.float64)
+        bytes_per_elem = 4 if dtype in ("fp32", "bf16") else (2 if dtype == "fp16" else 8)
+        expected_bytes = cols * bytes_per_elem
+
+        raw_vec_bytes = request.vector_bytes or b""
+        if len(raw_vec_bytes) != expected_bytes:
+            msg = f"Vector bytes size mismatch: expected {expected_bytes} bytes for length {cols} ({dtype}), got {len(raw_vec_bytes)} bytes"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        v_t = np.frombuffer(raw_vec_bytes, dtype=np_dtype).reshape((cols,))
+
+        t_start = time.perf_counter()
+        if dtype == "bf16":
+            a_f32 = matrix_a.astype(np.float32)
+            v_f32 = v_t.astype(np.float32)
+            res_f32 = np.matmul(a_f32, v_f32)
+            u32_res = res_f32.view(np.uint32) & 0xFFFF0000
+            res_vec = u32_res.view(np.float32)
+        elif dtype == "fp16":
+            res_vec = np.matmul(matrix_a.astype(np.float32), v_t.astype(np.float32)).astype(np.float16)
+        else:
+            res_vec = np.matmul(matrix_a, v_t)
+        exec_ms = max(int((time.perf_counter() - t_start) * 1000), 1)
+
+        # Fault Injection: Corrupt state vector
+        should_tamper = (
+            (self.tamper_step_index is not None and self.tamper_step_index == step_index)
+            or (step_index in self.tamper_step_indices)
+        )
+        if should_tamper:
+            res_vec = res_vec.copy()
+            perturbation = getattr(self, "tamper_step_perturbation", getattr(self, "tamper_perturbation", 5.0))
+            res_vec[0] += perturbation
+
+        result_bytes = res_vec.tobytes()
+        r_hash = hashlib.sha256(result_bytes).hexdigest()
+
+        # Sign result over (lease_id, step_index, sha256(result_bytes))
+        if self.tamper_step_signature:
+            sig = "00" * 64
+        else:
+            payload_to_sign = f"{lease_id}:{step_index}:{r_hash}".encode("utf-8")
+            sig = self.signer.sign_message(payload_to_sign)
+
+        with self._lock:
+            session["step_count"] += 1
+            self.uploaded_bytes_total += len(raw_vec_bytes)
+            self.recorded_steps.append((lease_id, step_index))
+
+        return pb2.IterativeStepResponse(
+            lease_id=lease_id,
+            step_index=step_index,
+            result_vector_bytes=result_bytes,
+            vector_length=rows,
+            worker_signature=sig,
+            execution_time_ms=exec_ms,
+        )
+
+    def ReleaseLease(
+        self,
+        request: pb2.ReleaseLeaseRequest,
+        context: Optional[grpc.ServicerContext] = None,
+    ) -> pb2.ReleaseLeaseResponse:
+        """
+        Deallocates pinned matrix tensor from memory and reclaims bytes.
+        """
+        lease_id = str(request.lease_id).strip()
+        if not lease_id:
+            msg = "lease_id must not be empty"
+            if context:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            raise ValueError(msg)
+
+        with self._lock:
+            self.release_calls += 1
+            session = self._pinned_sessions.pop(lease_id, None)
+            if session is not None:
+                bytes_freed = int(session.get("memory_bytes", 0))
+                if "matrix" in session and session["matrix"] is not None and isinstance(session["matrix"], np.ndarray):
+                    session["matrix"].fill(0)
+                session["is_zeroized"] = True
+                self.recorded_releases.append(lease_id)
+                is_released = True
+                msg = f"Lease '{lease_id}' successfully released; {bytes_freed} bytes freed"
+            else:
+                bytes_freed = 0
+                is_released = False
+                msg = f"Lease '{lease_id}' was not active or already released"
+
+        return pb2.ReleaseLeaseResponse(
+            lease_id=lease_id,
+            is_released=is_released,
+            bytes_freed=bytes_freed,
+            message=msg,
+        )
+
 
 class MockWorkerNode:
     """
@@ -633,4 +919,51 @@ class MockWorkerNode:
         """Clears recorded execution history."""
         with self.servicer._lock:
             self.servicer.execution_history.clear()
+
+    # Phase 3 Stateful Iterative Fault Injection & Introspection
+    def set_tamper_step_index(self, step_index: Optional[int], perturbation: float = 5.0) -> None:
+        """Injects arithmetic corruption into worker output at a specific step index."""
+        self.servicer.tamper_step_index = step_index
+        self.servicer.tamper_step_perturbation = perturbation
+
+    def set_tamper_step_indices(self, indices: Any, perturbation: float = 5.0) -> None:
+        """Injects corruption into multiple step indices."""
+        self.servicer.tamper_step_indices = set(indices)
+        self.servicer.tamper_step_perturbation = perturbation
+
+    def set_tamper_step_signature(self, tamper: bool = True) -> None:
+        """Produces invalid 00-filled Secp256k1 signatures on iterative steps."""
+        self.servicer.tamper_step_signature = tamper
+
+    def set_reject_lease(self, reject: bool = True, message: str = "Worker VRAM capacity exhausted") -> None:
+        """Simulates worker rejecting LeaseMatrix requests."""
+        self.servicer.reject_lease = reject
+        self.servicer.lease_reject_message = message
+
+    def set_expire_lease_early(self, expire: bool = True) -> None:
+        """Simulates premature lease expiration during iterative execution."""
+        self.servicer.expire_lease_early = expire
+
+    def set_expire_lease_after_step(self, step: Optional[int]) -> None:
+        """Simulates lease expiration after a given number of steps."""
+        self.servicer.expire_lease_after_step = step
+
+    def set_delay_step(self, seconds: float) -> None:
+        """Injects artificial delay into StepIterative calls."""
+        self.servicer.delay_step_seconds = seconds
+
+    def get_matrix_upload_count(self, lease_id: str) -> int:
+        """Returns number of times matrix A was uploaded under lease_id."""
+        with self.servicer._lock:
+            return self.servicer.matrix_upload_counts.get(lease_id, 0)
+
+    def get_pinned_sessions(self) -> Dict[str, Any]:
+        """Returns snapshot of current pinned sessions."""
+        with self.servicer._lock:
+            return dict(self.servicer._pinned_sessions)
+
+    def get_recorded_steps(self) -> List[Tuple[str, int]]:
+        """Returns sequence of executed (lease_id, step_index) steps."""
+        with self.servicer._lock:
+            return list(self.servicer.recorded_steps)
 

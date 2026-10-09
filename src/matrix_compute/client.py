@@ -281,6 +281,38 @@ class MatrixComputeClient:
             **kwargs,
         )
 
+    def power_iteration(
+        self,
+        A: np.ndarray,
+        v0: Optional[np.ndarray] = None,
+        iterations: int = 100,
+        dtype: Optional[str] = None,
+        lease_ttl_seconds: Optional[int] = None,
+        spot_check_probability: Optional[float] = None,
+        normalize: bool = False,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """
+        Executes distributed power iteration v_{iterations} = A^{iterations} v_0
+        using remote VRAM session leasing and probabilistic Freivalds verification.
+
+        Returns:
+            np.ndarray of shape (N,) containing the final state vector.
+        """
+        result = self.coordinator.execute_iterative_power(
+            A=A,
+            v0=v0,
+            iterations=iterations,
+            dtype=dtype,
+            lease_ttl_seconds=lease_ttl_seconds,
+            spot_check_probability=spot_check_probability,
+            normalize=normalize,
+            **kwargs,
+        )
+        if hasattr(result, "final_vector"):
+            return result.final_vector
+        return result
+
     def close(self) -> None:
         """
         Gracefully releases all client resources, channels, thread pools, and mock workers.
@@ -374,6 +406,35 @@ def distributed_matmul(
             grid_cols=grid_cols,
             grid_shape=grid_shape,
             **matmul_kwargs,
+        )
+
+
+def distributed_power_iteration(
+    A: np.ndarray,
+    v0: Optional[np.ndarray] = None,
+    iterations: int = 100,
+    dtype: str = "fp32",
+    config: Optional[ClientConfig] = None,
+    lease_ttl_seconds: Optional[int] = None,
+    spot_check_probability: Optional[float] = None,
+    normalize: bool = False,
+    **kwargs: Any,
+) -> np.ndarray:
+    """
+    Convenience top-level functional wrapper executing distributed power iteration.
+
+    Instantiates a temporary MatrixComputeClient, executes power iteration, and closes cleanly.
+    """
+    with MatrixComputeClient(config=config) as client:
+        return client.power_iteration(
+            A=A,
+            v0=v0,
+            iterations=iterations,
+            dtype=dtype,
+            lease_ttl_seconds=lease_ttl_seconds,
+            spot_check_probability=spot_check_probability,
+            normalize=normalize,
+            **kwargs,
         )
 
 

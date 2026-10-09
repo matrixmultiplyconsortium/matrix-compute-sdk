@@ -9,6 +9,8 @@ from .freivalds import (
     generate_random_binary_vector,
     higham_bound,
     matrix_infinity_norm,
+    vector_infinity_norm,
+    verify_iterative_step,
 )
 from .fraud_proof import (
     FraudProofBuilder,
@@ -22,10 +24,12 @@ __all__ = [
     "DEFAULT_FREIVALDS_ROUNDS",
     "DEFAULT_RELATIVE_TOLERANCE_FLOOR",
     "matrix_infinity_norm",
+    "vector_infinity_norm",
     "higham_bound",
     "generate_random_binary_vector",
     "FreivaldsVerifier",
     "freivalds_verify",
+    "verify_iterative_step",
     # Fraud Proof
     "FraudProofBuilder",
     "verify_fraud_proof",

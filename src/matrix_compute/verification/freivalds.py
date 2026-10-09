@@ -36,6 +36,7 @@ UNIT_ROUNDOFFS: Dict[str, float] = {
 
 DEFAULT_FREIVALDS_ROUNDS: int = 5
 DEFAULT_RELATIVE_TOLERANCE_FLOOR: float = 1e-7
+MAX_RELATIVE_DISCREPANCY_CEILING: float = 0.50
 
 
 def normalize_dtype(
@@ -108,6 +109,51 @@ def generate_random_binary_vector(n: int, seed: Optional[int] = None) -> np.ndar
     if not np.any(r):
         r[rng.randint(0, n), 0] = 1.0
     return r
+
+
+def vector_infinity_norm(vec: np.ndarray) -> float:
+    """Calculates vector infinity norm ||v||_inf = max(|v_i|)."""
+    if vec.size == 0:
+        return 0.0
+    return float(np.max(np.abs(vec.astype(np.float64))))
+
+
+class IterativeVerificationResult(tuple):
+    """
+    Result of single-step iterative Freivalds verification.
+    Subclasses tuple (is_valid, discrepancy, effective_bound, failure_proof)
+    so it can be unpacked as a 4-tuple or evaluated directly as a boolean.
+    """
+
+    def __new__(
+        cls,
+        is_valid: bool,
+        discrepancy: float,
+        effective_bound: float,
+        failure_proof: Dict[str, Any],
+    ) -> "IterativeVerificationResult":
+        return super().__new__(
+            cls, (bool(is_valid), float(discrepancy), float(effective_bound), failure_proof)
+        )
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self[0])
+
+    @property
+    def discrepancy(self) -> float:
+        return float(self[1])
+
+    @property
+    def effective_bound(self) -> float:
+        return float(self[2])
+
+    @property
+    def failure_proof(self) -> Dict[str, Any]:
+        return self[3]
+
+    def __bool__(self) -> bool:
+        return bool(self[0])
 
 
 class FreivaldsVerifier:
@@ -366,6 +412,221 @@ class FreivaldsVerifier:
             return False, reported_disc, effective_bound, best_failure_proof
         else:
             return True, max_discrepancy, effective_bound, {}
+
+    def verify_step(
+        self,
+        A: np.ndarray,
+        v_t: np.ndarray,
+        v_next: np.ndarray,
+        dtype: Optional[str] = None,
+        epsilon: Optional[float] = None,
+        **kwargs: Any,
+    ) -> IterativeVerificationResult:
+        """Instance method shortcut for single-step iterative verification."""
+        eff_eps = epsilon if epsilon is not None else getattr(self, "baseline_tolerance", None)
+        eff_rel = kwargs.get("relative_discrepancy_threshold", getattr(self, "relative_threshold", None))
+        return verify_iterative_step(
+            A=A,
+            v_t=v_t,
+            v_next=v_next,
+            dtype=dtype,
+            epsilon=eff_eps,
+            relative_discrepancy_threshold=eff_rel,
+            **kwargs,
+        )
+
+    @classmethod
+    def verify_iterative_step(
+        cls,
+        A: np.ndarray,
+        v_t: np.ndarray,
+        v_next: np.ndarray,
+        dtype: Optional[str] = None,
+        epsilon: Optional[float] = None,
+        **kwargs: Any,
+    ) -> IterativeVerificationResult:
+        """Classmethod entrypoint for single-step iterative verification."""
+        return verify_iterative_step(A=A, v_t=v_t, v_next=v_next, dtype=dtype, epsilon=epsilon, **kwargs)
+
+
+def verify_iterative_step(
+    A: np.ndarray,
+    v_t: np.ndarray,
+    v_next: np.ndarray,
+    dtype: Optional[str] = "fp32",
+    epsilon: Optional[float] = None,
+    epsilon_tolerance: Optional[float] = None,
+    relative_discrepancy_threshold: Optional[float] = None,
+    failure_proof_dict: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> IterativeVerificationResult:
+    """
+    Verifies a single-step iterative state transition v_{t+1} == A * v_t
+    using Higham floating-point forward error bounds.
+
+    Returns:
+        IterativeVerificationResult(is_valid, discrepancy, effective_bound, failure_proof).
+    """
+    if not isinstance(A, np.ndarray) or A.ndim != 2:
+        raise MatrixDimensionError(
+            f"Matrix A must be a 2D numpy array, got {getattr(A, 'ndim', type(A))}D",
+            shape_a=getattr(A, "shape", None),
+        )
+
+    if not isinstance(v_t, np.ndarray) or v_t.ndim not in (1, 2):
+        raise MatrixDimensionError(
+            f"State vector v_t must be a 1D or 2D column vector, got {getattr(v_t, 'ndim', type(v_t))}D",
+        )
+
+    if not isinstance(v_next, np.ndarray) or v_next.ndim not in (1, 2):
+        raise MatrixDimensionError(
+            f"Result vector v_next must be a 1D or 2D column vector, got {getattr(v_next, 'ndim', type(v_next))}D",
+        )
+
+    m, k = A.shape
+    v_t_arr = np.asarray(v_t)
+    v_next_arr = np.asarray(v_next)
+    vt_flat = v_t_arr.flatten().astype(np.float64)
+    vnext_flat = v_next_arr.flatten().astype(np.float64)
+
+    if vt_flat.size != k:
+        raise MatrixDimensionError(
+            f"Inner dimension mismatch: Matrix A columns ({k}) != vector v_t length ({vt_flat.size})",
+            shape_a=A.shape,
+            expected_inner_dim=k,
+        )
+
+    if vnext_flat.size != m:
+        raise MatrixDimensionError(
+            f"Result dimension mismatch: Matrix A rows ({m}) != vector v_next length ({vnext_flat.size})",
+            shape_a=A.shape,
+            expected_inner_dim=m,
+        )
+
+    norm_dt = normalize_dtype(dtype, fallback_tensor=A)
+
+    # Check Finiteness (NaN / Inf Detection)
+    if not (np.all(np.isfinite(A)) and np.all(np.isfinite(vt_flat)) and np.all(np.isfinite(vnext_flat))):
+        proof = {
+            "vector_vt": vt_flat.tolist() if np.all(np.isfinite(vt_flat)) else [],
+            "vector_av": [],
+            "vector_v_next": vnext_flat.tolist() if np.all(np.isfinite(vnext_flat)) else [],
+            "observed_diff": float("inf"),
+            "dynamic_bound": 1e-6,
+            "max_observed_discrepancy": float("inf"),
+            "dimension_m": int(m),
+            "dimension_k": int(k),
+            "dimension_n": int(k),
+            "dtype": norm_dt,
+            "reason": "Non-finite value (NaN/Inf) detected in matrix A or vectors",
+        }
+        if failure_proof_dict is not None and isinstance(failure_proof_dict, dict):
+            failure_proof_dict.update(proof)
+        return IterativeVerificationResult(False, float("inf"), 1e-6, proof)
+
+    # Compute Higham Dynamic Error Bound for GEMV
+    norm_a = matrix_infinity_norm(A)
+    norm_vt = vector_infinity_norm(vt_flat)
+    scale = norm_a * norm_vt
+
+    u = get_unit_roundoff(norm_dt)
+    ku = float(k) * u
+    gamma_k = (ku / (1.0 - ku)) if ku < 0.999 else (ku * 1000.0)
+
+    raw_dynamic_bound = gamma_k * scale
+    min_bound_floor = u * scale if scale > 0 else u
+
+    eff_eps = epsilon_tolerance if epsilon_tolerance is not None else epsilon
+    if eff_eps is not None:
+        effective_bound = max(raw_dynamic_bound, float(eff_eps) if scale >= 1.0 else float(eff_eps) * scale, min_bound_floor)
+    else:
+        effective_bound = max(raw_dynamic_bound, min_bound_floor)
+
+    # Reference Verification in float64
+    a_f64 = A.astype(np.float64)
+    av_ref = np.matmul(a_f64, vt_flat)
+    diff_vec = np.abs(av_ref - vnext_flat)
+    discrepancy = float(np.max(diff_vec))
+
+    if np.isnan(discrepancy) or np.isinf(discrepancy):
+        proof = {
+            "vector_vt": vt_flat.tolist(),
+            "vector_av": av_ref.tolist(),
+            "vector_v_next": vnext_flat.tolist(),
+            "observed_diff": float("inf"),
+            "dynamic_bound": float(effective_bound),
+            "max_observed_discrepancy": float("inf"),
+            "dimension_m": int(m),
+            "dimension_k": int(k),
+            "dimension_n": int(k),
+            "dtype": norm_dt,
+            "reason": "Non-finite difference encountered during verification",
+        }
+        if failure_proof_dict is not None and isinstance(failure_proof_dict, dict):
+            failure_proof_dict.update(proof)
+        return IterativeVerificationResult(False, float("inf"), float(effective_bound), proof)
+
+    # Underflow & Relative Discrepancy Defense
+    av_norm = vector_infinity_norm(av_ref)
+    vnext_norm = vector_infinity_norm(vnext_flat)
+    denom = max(scale, av_norm, vnext_norm)
+
+    underflow_threshold = 1e-30 if norm_dt in ("fp32", "float32", "fp16", "float16", "bf16", "bfloat16") else 1e-100
+    is_underflow_regime = scale < underflow_threshold or denom < underflow_threshold
+
+    is_fraud = False
+    failure_reason = ""
+    if scale == 0.0 or norm_a == 0.0 or norm_vt == 0.0:
+        if discrepancy > DEFAULT_RELATIVE_TOLERANCE_FLOOR:
+            is_fraud = True
+            failure_reason = f"Observed discrepancy {discrepancy:.6e} exceeded dynamic Higham bound {effective_bound:.6e}"
+    elif is_underflow_regime and discrepancy < underflow_threshold:
+        is_fraud = False
+    elif discrepancy <= effective_bound:
+        is_fraud = False
+    else:
+        is_fraud = True
+        failure_reason = f"Observed discrepancy {discrepancy:.6e} exceeded dynamic Higham bound {effective_bound:.6e}"
+
+    out_norm = max(av_norm, vnext_norm)
+    out_denom = max(out_norm, min_bound_floor, underflow_threshold)
+    rel_diff = discrepancy / out_denom
+
+    if relative_discrepancy_threshold is not None:
+        allowed_rel = float(relative_discrepancy_threshold)
+    else:
+        allowed_rel = min(max(gamma_k, DEFAULT_RELATIVE_TOLERANCE_FLOOR), MAX_RELATIVE_DISCREPANCY_CEILING)
+
+    if not is_fraud and out_denom > underflow_threshold:
+        if rel_diff > allowed_rel:
+            is_fraud = True
+            failure_reason = f"Observed relative discrepancy {rel_diff:.6e} exceeded tolerance {allowed_rel:.6e} (discrepancy {discrepancy:.6e}, output norm {out_denom:.6e})"
+
+    if is_fraud:
+        proof = {
+            "vector_vt": vt_flat.tolist(),
+            "vector_av": av_ref.tolist(),
+            "vector_v_next": vnext_flat.tolist(),
+            "observed_diff": float(discrepancy),
+            "dynamic_bound": float(effective_bound),
+            "max_observed_discrepancy": float(discrepancy),
+            "dimension_m": int(m),
+            "dimension_k": int(k),
+            "dimension_n": int(k),
+            "dtype": norm_dt,
+            "vector_vt_norm": norm_vt,
+            "matrix_a_norm": norm_a,
+            "reason": (
+                failure_reason
+                if failure_reason
+                else f"Observed discrepancy {discrepancy:.6e} exceeded dynamic Higham bound {effective_bound:.6e}"
+            ),
+        }
+        if failure_proof_dict is not None and isinstance(failure_proof_dict, dict):
+            failure_proof_dict.update(proof)
+        return IterativeVerificationResult(False, float(discrepancy), float(effective_bound), proof)
+
+    return IterativeVerificationResult(True, float(discrepancy), float(effective_bound), {})
 
 
 def freivalds_verify(
