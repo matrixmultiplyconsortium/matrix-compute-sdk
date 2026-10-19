@@ -32,6 +32,7 @@ from matrix_compute.p2p.channel_pool import ChannelPool
 from matrix_compute.p2p.dispatcher import GrpcTaskDispatcher
 from matrix_compute.payment.backend import HttpSettlementBackend, MockSettlementBackend
 from matrix_compute.payment.escrow import EscrowManager
+from matrix_compute.payment.lnd_payer import LndPayer
 from matrix_compute.test_doubles.mock_relay import MockNostrRelay
 from matrix_compute.test_doubles.mock_settlement import MockSettlementService
 from matrix_compute.test_doubles.mock_worker import MockWorkerNode
@@ -119,11 +120,23 @@ class MatrixComputeClient:
                 timeout_seconds=self.config.connect_timeout_seconds,
             )
 
+        lnd_payer = None
+        if self.config.lnd_payer_enabled or self.config.consumer_lnd_rest_url:
+            lnd_payer = LndPayer(
+                rest_url=self.config.consumer_lnd_rest_url,
+                macaroon_hex=self.config.consumer_lnd_macaroon_hex,
+                macaroon_path=self.config.consumer_lnd_macaroon_path,
+                tls_cert=self.config.consumer_lnd_tls_cert,
+                tls_path=self.config.consumer_lnd_tls_path,
+                timeout_seconds=self.config.task_timeout_seconds,
+            )
+
         self.escrow_manager = EscrowManager(
             settlement_backend=backend,
             default_timeout_seconds=self.config.task_timeout_seconds,
             verification_key=self.config.settlement_verification_key,
             auto_settle=False,
+            lnd_payer=lnd_payer,
         )
 
         # 4. P2P gRPC subsystem

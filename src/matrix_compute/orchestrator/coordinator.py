@@ -1011,7 +1011,8 @@ class DistributedMatmulCoordinator:
 
         effective_ttl = int(lease_ttl_seconds or getattr(self.config, "lease_ttl_seconds", 3600))
         escrow_timeout = float(effective_ttl + 300)
-        task_id = f"task_{job_id}"
+        lease_id = f"lease_{uuid.uuid4().hex[:12]}"
+        task_id = lease_id
 
         # Provision and hold HODL escrow
         try:
@@ -1044,7 +1045,6 @@ class DistributedMatmulCoordinator:
         # =====================================================================
         # Stage 3: Lease Matrix Uploading Matrix A Strictly Once
         # =====================================================================
-        lease_id = f"lease_{uuid.uuid4().hex[:12]}"
         matrix_bytes = matrix_a.tobytes()
 
         # Identify if worker is a mock worker with an in-memory servicer

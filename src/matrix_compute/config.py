@@ -76,6 +76,24 @@ class ClientConfig(BaseModel):
     settlement_verification_key: str = Field(
         "settlement_secret_key_dev", description="L402 Macaroon HMAC verification key"
     )
+    lnd_payer_enabled: bool = Field(
+        False, description="Enable genuine LND wallet payments for HODL invoices"
+    )
+    consumer_lnd_rest_url: Optional[str] = Field(
+        None, description="Consumer LND REST API base URL (e.g. https://127.0.0.1:8081)"
+    )
+    consumer_lnd_macaroon_hex: Optional[str] = Field(
+        None, description="Hex-encoded Consumer LND admin macaroon"
+    )
+    consumer_lnd_macaroon_path: Optional[str] = Field(
+        None, description="File path to Consumer LND admin.macaroon"
+    )
+    consumer_lnd_tls_cert: Optional[str] = Field(
+        None, description="Consumer LND TLS cert PEM string"
+    )
+    consumer_lnd_tls_path: Optional[str] = Field(
+        None, description="File path to Consumer LND tls.cert"
+    )
 
     # Network Timeouts & Retries
     connect_timeout_seconds: float = Field(5.0, ge=0.1, description="Worker gRPC connection timeout")
@@ -248,6 +266,12 @@ class ClientConfig(BaseModel):
             "mock_workers": ["MATRIX_MOCK_WORKERS"],
             "require_confidential_compute": ["MATRIX_REQUIRE_CONFIDENTIAL_COMPUTE", "REQUIRE_CONFIDENTIAL_COMPUTE"],
             "required_tee_type": ["MATRIX_REQUIRED_TEE_TYPE", "REQUIRED_TEE_TYPE"],
+            "lnd_payer_enabled": ["MATRIX_LND_PAYER_ENABLED", "LND_PAYER_ENABLED"],
+            "consumer_lnd_rest_url": ["CONSUMER_LND_REST_URL", "MATRIX_CONSUMER_LND_REST_URL", "LND_REST_URL"],
+            "consumer_lnd_macaroon_hex": ["CONSUMER_LND_MACAROON_HEX", "MATRIX_CONSUMER_LND_MACAROON_HEX", "LND_MACAROON_HEX"],
+            "consumer_lnd_macaroon_path": ["CONSUMER_LND_MACAROON_PATH", "MATRIX_CONSUMER_LND_MACAROON_PATH", "LND_MACAROON_PATH"],
+            "consumer_lnd_tls_cert": ["CONSUMER_LND_TLS_CERT", "MATRIX_CONSUMER_LND_TLS_CERT", "LND_TLS_CERT"],
+            "consumer_lnd_tls_path": ["CONSUMER_LND_TLS_PATH", "MATRIX_CONSUMER_LND_TLS_PATH", "LND_TLS_PATH"],
         }
 
         enriched = dict(data)
@@ -265,6 +289,7 @@ class ClientConfig(BaseModel):
             "ssl_enabled",
             "offline_mock_mode",
             "mock_relay",
+            "lnd_payer_enabled",
             "mock_settlement",
             "mock_workers",
             "require_confidential_compute",

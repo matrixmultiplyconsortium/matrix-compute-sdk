@@ -271,6 +271,7 @@ class EscrowManager:
         self.settlement_backend: SettlementBackendProtocol = (
             settlement_backend if settlement_backend is not None else MockSettlementService()
         )
+        self.lnd_payer = kwargs.get("lnd_payer")
 
         self._lock = threading.RLock()
         self._escrows: Dict[str, EscrowState] = {}          # task_id -> EscrowState
@@ -569,10 +570,13 @@ class EscrowManager:
                 )
 
             try:
-                self.settlement_backend.hold_invoice(escrow.payment_hash)
+                if self.lnd_payer is not None and escrow.payment_request:
+                    self.lnd_payer.pay_invoice(escrow.payment_request)
+                else:
+                    self.settlement_backend.hold_invoice(escrow.payment_hash)
             except Exception as ex:
                 raise EscrowStateError(
-                    f"Settlement backend failed to hold invoice: {ex}",
+                    f"Settlement backend or LND payer failed to hold invoice: {ex}",
                     task_id=escrow.task_id,
                     current_status=escrow.status.value,
                     attempted_transition="HOLD",

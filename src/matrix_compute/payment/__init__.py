@@ -20,6 +20,8 @@ from .l402_client import (
     format_grpc_metadata,
 )
 
+from .lnd_payer import LndPayer
+
 __all__ = [
     # Escrow State Machine
     "EscrowManager",
@@ -39,4 +41,6 @@ __all__ = [
     "L402PaymentCoordinator",
     "MockSettlementBackend",
     "HttpSettlementBackend",
+    "LndPayer",
 ]
+
