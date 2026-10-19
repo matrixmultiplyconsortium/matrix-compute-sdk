@@ -690,7 +690,7 @@ def test_relay_client_multi_worker_slot_matching(mock_relay):
         ev = make_raw_event(pubkey=pk, sats_per_gflop=0.0001 * (i + 1), extra_tags=[["slots_available", "1"]])
         mock_relay.publish(ev)
 
-    req = WorkerQueryRequest(min_vram_mb=8192, required_slots=3)
+    req = WorkerQueryRequest(min_vram_mb=8192, max_price_sats_per_gflop=0.001, required_slots=3)
     resp = client.query_workers(req, force_refresh=True)
     assert resp.status == "SUCCESS"
     assert len(resp.matched_workers) == 3
@@ -721,7 +721,7 @@ def test_relay_client_and_matchmaker_nan_inf_sanitization():
     assert worker.peak_fp32_tflops == 0.0
 
     mm = Matchmaker()
-    res = mm.match_worker(workers=[worker], m=1024, k=1024, n=1024)
+    res = mm.match_worker(workers=[worker], m=1024, k=1024, n=1024, min_vram_mb=0)
     assert res.estimated_cost_sats >= 0
     assert math.isfinite(res.estimated_cost_sats)
 

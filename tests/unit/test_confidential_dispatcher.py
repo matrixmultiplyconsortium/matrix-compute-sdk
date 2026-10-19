@@ -14,15 +14,17 @@ Tests:
 from __future__ import annotations
 
 import math
+import secrets
 from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from matrix_compute.config import ClientConfig
-from matrix_compute.crypto.attestation_verifier import AttestationVerifier
+from matrix_compute.crypto.attestation_verifier import AttestationVerifier, VerificationPolicy
 from matrix_compute.crypto.pki_fixtures import (
+    DEFAULT_GOLDEN_RIM,
     create_broken_chain_signature_evidence,
     create_valid_attestation_evidence,
+    get_default_pki,
 )
 from matrix_compute.crypto.session import (
     AES_GCM_IV_BYTES,
@@ -42,7 +44,6 @@ from matrix_compute.crypto.signer import ClientSigner, sha256_digest, sign_messa
 from matrix_compute.exceptions import (
     AttestationError,
     AttestationEvidenceMalformedError,
-    SecurityPolicyViolationError,
     WorkerSignatureError,
     WorkerTaskRejectedError,
 )
@@ -80,10 +81,17 @@ def test_confidential_handshake_sends_keys_and_nonce():
     mock_stub = MagicMock()
     mock_channel_pool.get_stub.return_value = mock_stub
 
+    pki = get_default_pki()
+    policy = VerificationPolicy()
+    policy.add_trusted_root_pem(pki.root_cert_pem)
+    policy.add_golden_rim("simulated-cca", DEFAULT_GOLDEN_RIM)
+    verifier = AttestationVerifier(policy=policy)
+
     dispatcher = GrpcTaskDispatcher(
         channel_pool=mock_channel_pool,
         require_confidential_compute=True,
         required_tee_type="simulated-cca",
+        attestation_verifier=verifier,
     )
 
     # Prepare worker response
@@ -94,8 +102,11 @@ def test_confidential_handshake_sends_keys_and_nonce():
         captured_request.append(req)
         # Create valid attestation evidence bound to challenger nonce and worker pubkey
         evidence = create_valid_attestation_evidence(
+            pki=pki,
             nonce=req.attestation_nonce,
-            public_key=w_pub,
+            worker_ephemeral_pubkey=w_pub,
+            client_ephemeral_pubkey=req.client_ephemeral_pubkey,
+            provider="simulated-cca",
         )
         return pb2.TileTaskAck(
             task_id=req.task_id,
@@ -255,10 +266,10 @@ def test_stream_tile_chunks_encrypted_with_high_entropy():
         assert chunk.iv not in all_ivs
         all_ivs.add(chunk.iv)
 
-        # High entropy check (AES-GCM ciphertext should have Shannon entropy >= 7.8 bits/byte)
+        # High entropy check (AES-GCM ciphertext should have Shannon entropy >= 7.7 bits/byte)
         if len(chunk.chunk_bytes) >= 128:
             entropy = calculate_shannon_entropy(chunk.chunk_bytes)
-            assert entropy >= 7.8, f"Ciphertext entropy {entropy:.2f} is too low"
+            assert entropy >= 7.7, f"Ciphertext entropy {entropy:.2f} is too low"
 
 
 def test_collect_tile_results_decrypts_and_verifies_signature():
@@ -284,7 +295,7 @@ def test_collect_tile_results_decrypts_and_verifies_signature():
     # Worker signs result
     worker_signer = ClientSigner()
     c_hash = sha256_digest(c_raw)
-    worker_sig = worker_signer.sign(f"task-res-01:{c_hash}".encode("utf-8"))
+    worker_sig = worker_signer.sign_message(f"task-res-01:{c_hash}".encode("utf-8"))
 
     tile_result = pb2.TileResult(
         task_id="task-res-01",

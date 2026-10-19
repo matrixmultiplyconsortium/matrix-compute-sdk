@@ -879,7 +879,7 @@ class TestRapidWorkerFailureCascadesAndFailover:
         """A blacklisted worker becomes eligible again after blacklist_cooldown expires."""
         mm = Matchmaker(blacklist_threshold=3, blacklist_cooldown=300.0)
         pk = "02" + "7" * 64
-        t0 = 1000000.0
+        t0 = time.time()
 
         for _ in range(3):
             mm.record_failure(pk)

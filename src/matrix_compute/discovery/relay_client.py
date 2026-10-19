@@ -149,7 +149,7 @@ class RelayClient:
         self.timeout = float(timeout)
         self.cache_ttl = float(cache_ttl)
         self.verify_signatures = bool(verify_signatures)
-        self.offline_mock_mode = bool(offline_mock_mode)
+        self.offline_mock_mode = bool(offline_mock_mode or (mock_relay is not None))
 
         self._lock = threading.RLock()
         self._cache: Dict[Tuple[str, str], Tuple[DiscoveredWorker, float]] = {}  # (pubkey, d_tag) -> (worker, expires_at)

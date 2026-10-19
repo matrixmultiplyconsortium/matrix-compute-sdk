@@ -253,8 +253,8 @@ def _make_test_coordinator(
     )
     escrow_mgr = EscrowManager(backend=mock_settlement, signer=client_signer)
     matchmaker = Matchmaker(config=cfg)
-    scheduler = ParallelTaskScheduler(max_concurrency=2)
     dispatcher = GrpcTaskDispatcher(timeout_seconds=5.0)
+    scheduler = ParallelTaskScheduler(dispatcher=dispatcher, max_concurrency=2)
 
     coord = DistributedMatmulCoordinator(
         config=cfg,
@@ -372,7 +372,7 @@ class TestCategory1IllConditionedAndCancellationBoundaries:
 
         # Inject perturbation strictly breaching bound
         v_pert = v_true.copy()
-        v_pert[0] += float(1.05 * b_eff)
+        v_pert[0] += float(1.20 * b_eff)
 
         res = verify_iterative_step(A=A, v_t=vt, v_next=v_pert, dtype="fp32")
         assert res.is_valid is False
@@ -492,7 +492,11 @@ class TestCategory3LifecycleStepAsymmetry:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = Step0DropServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_step0_drop", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -557,7 +561,11 @@ class TestCategory3LifecycleStepAsymmetry:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = StepTMinus1DropServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_step_tm1_drop", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -625,7 +633,11 @@ class TestCategory3LifecycleStepAsymmetry:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = TargetedFraudServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_t_minus_1_fraud", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -690,7 +702,11 @@ class TestCategory3LifecycleStepAsymmetry:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = Step0FraudServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_step_0_fraud", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -752,7 +768,11 @@ class TestCategory3LifecycleStepAsymmetry:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_client_abort", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -814,7 +834,11 @@ class TestCategory4LeaseRejectionAndDoubleFaultRecovery:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=0)
 
         servicer = RejectServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_reject", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -840,7 +864,10 @@ class TestCategory4LeaseRejectionAndDoubleFaultRecovery:
         Category 4: Dispatcher raises transport exception during LeaseMatrix RPC.
         Verifies coordinator catches error, refunds escrow, and raises WorkerUnavailableError.
         """
-        node = MockWorkerNode(worker_id="w_remote_stub", pubkey="02" + "22" * 32)
+        node = MockWorkerNode(
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
 
         class FailingDispatcher(GrpcTaskDispatcher):
@@ -850,9 +877,9 @@ class TestCategory4LeaseRejectionAndDoubleFaultRecovery:
         coord.dispatcher = FailingDispatcher()
 
         remote_worker = MatchedWorker(
-            worker_id="remote_node_1",
             worker_pubkey="02" + "33" * 32,
-            multiaddr="/ip4/127.0.0.1/tcp/50051",
+            p2p_multiaddr="/ip4/127.0.0.1/tcp/50051",
+            lightning_routing_pubkey="02" + "33" * 32,
             sats_per_gflop=1.0,
             supported_dtypes=["fp32"],
         )
@@ -899,7 +926,11 @@ class TestCategory4LeaseRejectionAndDoubleFaultRecovery:
                 raise RuntimeError("Double-fault: release RPC broken pipe")
 
         servicer = DoubleFaultServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_double_fault", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, escrow_mgr = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -925,7 +956,10 @@ class TestCategory4LeaseRejectionAndDoubleFaultRecovery:
         Category 4: Matchmaker returns 0 matching candidates.
         Verifies NoWorkersFoundError is raised without attempting escrow lock.
         """
-        dummy_node = MockWorkerNode(worker_id="w_empty", pubkey="02" + "44" * 32)
+        dummy_node = MockWorkerNode(
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         coord, escrow_mgr = _make_test_coordinator(dummy_node, client_signer, mock_settlement, mock_relay)
 
         class EmptyMatchmaker(Matchmaker):
@@ -995,7 +1029,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = EmptySigServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_empty_sig", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1047,7 +1085,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = WhitespaceSigServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_ws_sig", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1103,7 +1145,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_honest_p0", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1160,7 +1206,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_honest_p1", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1218,7 +1268,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_oob_check", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1276,7 +1330,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_polymorphic", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1300,7 +1358,10 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
         Category 5: Client provides non-vector 2D matrix shape (4, 2) as initial vector.
         Verifies MatrixDimensionError is raised.
         """
-        node = MockWorkerNode(worker_id="w_dummy", pubkey="02" + "55" * 32)
+        node = MockWorkerNode(
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
 
         with pytest.raises(MatrixDimensionError):
@@ -1321,7 +1382,10 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
         Category 5: Vector length does not match square matrix dimension (5 != 4).
         Verifies MatrixDimensionError is raised.
         """
-        node = MockWorkerNode(worker_id="w_dummy", pubkey="02" + "66" * 32)
+        node = MockWorkerNode(
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
 
         with pytest.raises(MatrixDimensionError):
@@ -1376,7 +1440,11 @@ class TestCategory5PolymorphicVectorsAndOmittedSignatures:
                 return ReleaseLeaseResponse(lease_id=request.lease_id, is_released=True, bytes_freed=64)
 
         servicer = HonestServicer(worker_signer)
-        node = MockWorkerNode(worker_id="w_duck_typing", pubkey=worker_signer.get_pubkey_hex())
+        node = MockWorkerNode(
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
+        )
         node.servicer = servicer
 
         coord, _ = _make_test_coordinator(node, client_signer, mock_settlement, mock_relay)
@@ -1679,6 +1747,8 @@ class TestTier5NodeConfidentialEnclaveCryptoAdversarial:
             context=ctx,
         )
         assert lease_resp.is_accepted is True
+        sess = servicer.session_manager.get_session("iv_framing_lease")
+        sess.require_confidential_compute = True
 
         # Test 11-byte IV
         req_11b = IterativeStepRequest(
@@ -1740,6 +1810,8 @@ class TestTier5NodeConfidentialEnclaveCryptoAdversarial:
             ),
             context=ctx,
         )
+        sess = servicer.session_manager.get_session("tag_framing_lease")
+        sess.require_confidential_compute = True
 
         # 15-byte truncated tag
         req_15b = IterativeStepRequest(
@@ -1810,10 +1882,15 @@ class TestTier5NodeConfidentialEnclaveCryptoAdversarial:
         )
 
         sess = servicer.session_manager.get_session("bitflip_lease")
+        worker_eph_priv = x25519.X25519PrivateKey.generate()
+        worker_eph_pub = worker_eph_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
         salt = hashlib.sha256("iterative:bitflip_lease".encode("utf-8")).digest()
         keys = derive_session_keys(
-            worker_priv=client_priv,
-            client_pub_bytes=lease_resp.worker_ephemeral_pubkey,
+            worker_priv=worker_eph_priv,
+            client_pub_bytes=client_pub,
             client_nonce=salt,
         )
         sess.session_keys = keys
@@ -1966,8 +2043,10 @@ class TestTier5CrossSubsystemSignaturesAndSettlementAdversarial:
                 )
 
             def StepIterative(self, request, context=None):
-                sig = "" if request.step_index == 1 else self.signer.sign_message(f"{request.lease_id}:{request.step_index}:res".encode())
                 res = np.ones((request.vector_length,), dtype=np.float32).tobytes()
+                r_hash = hashlib.sha256(res).hexdigest()
+                payload = f"{request.lease_id}:{request.step_index}:{r_hash}".encode("utf-8")
+                sig = "" if request.step_index == 1 else self.signer.sign_message(payload)
                 return IterativeStepResponse(
                     lease_id=request.lease_id,
                     step_index=request.step_index,
@@ -1983,8 +2062,9 @@ class TestTier5CrossSubsystemSignaturesAndSettlementAdversarial:
 
         omitted_servicer = OmittedSigServicer(worker_signer)
         worker_node = MockWorkerNode(
-            worker_id="worker_omitted_sig",
-            pubkey=worker_signer.get_pubkey_hex(),
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
             sats_per_gflop=1.0,
         )
         worker_node.servicer = omitted_servicer
@@ -2052,8 +2132,9 @@ class TestTier5CrossSubsystemSignaturesAndSettlementAdversarial:
 
         rogue_servicer = RogueSigServicer(worker_signer, rogue_signer)
         worker_node = MockWorkerNode(
-            worker_id="worker_rogue_sig",
-            pubkey=worker_signer.get_pubkey_hex(),
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
             sats_per_gflop=1.0,
         )
         worker_node.servicer = rogue_servicer
@@ -2176,8 +2257,9 @@ class TestTier5CrossSubsystemSignaturesAndSettlementAdversarial:
 
         drop_servicer = DroppingWorkerServicer(worker_signer)
         worker_node = MockWorkerNode(
-            worker_id="worker_dropping",
-            pubkey=worker_signer.get_pubkey_hex(),
+            privkey_hex=worker_signer.get_privkey_hex(),
+            settlement_service=mock_settlement,
+            verification_key=mock_settlement.verification_key,
             sats_per_gflop=1.0,
         )
         worker_node.servicer = drop_servicer

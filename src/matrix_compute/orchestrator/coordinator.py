@@ -59,7 +59,7 @@ except ImportError:
 from matrix_compute.config import ClientConfig, PartitioningStrategy
 from matrix_compute.crypto.signer import ClientSigner, verify_signature
 from matrix_compute.discovery.matchmaker import Matchmaker
-from matrix_compute.discovery.relay_client import DiscoveredWorker, RelayClient, parse_multiaddr
+from matrix_compute.discovery.relay_client import DiscoveredWorker, RelayClient
 from matrix_compute.exceptions import (
     FraudDetectedError,
     MatrixDimensionError,
@@ -156,6 +156,30 @@ class IterativeResult:
 
     def copy(self) -> np.ndarray:
         return self.final_vector.copy()
+
+    def __mul__(self, other: Any) -> Any:
+        return self.final_vector * other
+
+    def __rmul__(self, other: Any) -> Any:
+        return other * self.final_vector
+
+    def __add__(self, other: Any) -> Any:
+        return self.final_vector + other
+
+    def __radd__(self, other: Any) -> Any:
+        return other + self.final_vector
+
+    def __sub__(self, other: Any) -> Any:
+        return self.final_vector - other
+
+    def __rsub__(self, other: Any) -> Any:
+        return other - self.final_vector
+
+    def __truediv__(self, other: Any) -> Any:
+        return self.final_vector / other
+
+    def __rtruediv__(self, other: Any) -> Any:
+        return other / self.final_vector
 
 
 class DistributedMatmulCoordinator:
@@ -926,7 +950,7 @@ class DistributedMatmulCoordinator:
             raise ValueError("Input matrix A and vector v0 must contain strictly finite values (no NaN or Inf)")
 
         # Precision normalization
-        norm_dtype = normalize_dtype(dtype, fallback_tensor=A)
+        norm_dtype = normalize_dtype(dtype if dtype is not None else A.dtype)
         if norm_dtype == "fp16":
             matrix_a = A.astype(np.float16)
             v_curr = v_curr.astype(np.float16)
@@ -1103,7 +1127,10 @@ class DistributedMatmulCoordinator:
                         vector_length=n,
                         dtype=norm_dtype,
                     )
+                    t_step_start = time.time()
                     step_resp = matching_mock_worker.servicer.StepIterative(step_req)
+                    if eff_timeout is not None and (time.time() - t_step_start) > eff_timeout:
+                        raise TimeoutError(f"Step {t} execution timed out (exceeded {eff_timeout}s)")
                     res_bytes = step_resp.result_vector_bytes
                     v_next = np.frombuffer(res_bytes, dtype=np_res_dtype).reshape((n,))
                     step_sig = getattr(step_resp, "worker_signature", "")
@@ -1197,17 +1224,11 @@ class DistributedMatmulCoordinator:
                         )
 
                         if hasattr(self.escrow_manager, "abort_and_refund"):
-                            try:
-                                self.escrow_manager.abort_and_refund(
-                                    task_id=task_id,
-                                    reason=f"fraud_detected_step_{t}",
-                                    fraud_proof=fraud_proof,
-                                )
-                            except TypeError:
-                                self.escrow_manager.abort_and_refund(
-                                    task_id=task_id,
-                                    reason=f"fraud_detected_step_{t}",
-                                )
+                            self.escrow_manager.abort_and_refund(
+                                task_id,
+                                reason=f"fraud_detected_step_{t}",
+                                fraud_proof=fraud_proof,
+                            )
                         self._submit_fraud_slashing(fraud_proof)
 
                         raise FraudDetectedError(

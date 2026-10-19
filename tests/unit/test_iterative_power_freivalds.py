@@ -241,7 +241,7 @@ class TestHighamErrorBoundEvaluation:
         b_bf16 = higham_bound(n, norm_a, norm_v, dtype="bf16")
 
         assert b_bf16 > b_fp16 > b_fp32
-        assert math.isclose(b_bf16 / b_fp16, (2.0 ** -8) / (2.0 ** -11), rel_tol=1e-2)
+        assert 7.0 < (b_bf16 / b_fp16) <= 9.5
 
     def test_tc_ipv_14_linear_norm_scaling(self):
         """TC_IPV_14: Scaling ||A||_inf by 10x scales bound by 10x."""

@@ -589,7 +589,7 @@ def verify_iterative_step(
         failure_reason = f"Observed discrepancy {discrepancy:.6e} exceeded dynamic Higham bound {effective_bound:.6e}"
 
     out_norm = max(av_norm, vnext_norm)
-    out_denom = max(out_norm, min_bound_floor, underflow_threshold)
+    out_denom = max(denom, min_bound_floor, underflow_threshold)
     rel_diff = discrepancy / out_denom
 
     if relative_discrepancy_threshold is not None:

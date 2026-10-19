@@ -590,6 +590,9 @@ class EscrowManager:
         worker_lightning_addr: str = "worker@node",
         timeout_seconds: Optional[float] = None,
         max_gflops: float = 100.0,
+        custom_preimage: Optional[str] = None,
+        payment_hash: Optional[str] = None,
+        **kwargs: Any,
     ) -> EscrowState:
         """Convenience method: creates escrow and immediately transitions to HELD."""
         with self._lock:
@@ -599,6 +602,9 @@ class EscrowManager:
                 worker_lightning_addr=worker_lightning_addr,
                 timeout_seconds=timeout_seconds,
                 max_gflops=max_gflops,
+                custom_preimage=custom_preimage,
+                payment_hash=payment_hash,
+                **kwargs,
             )
             return self.hold_escrow(escrow.task_id)
 
@@ -739,7 +745,7 @@ class EscrowManager:
 
             if hasattr(self.settlement_backend, "settle_batch"):
                 try:
-                    self.settlement_backend.settle_batch(escrow.job_id or escrow.payment_hash, effective_preimage)
+                    self.settlement_backend.settle_batch(escrow.payment_hash, effective_preimage)
                 except Exception as ex:
                     raise SettlementError(
                         f"Settlement backend rejected batch settlement: {ex}",

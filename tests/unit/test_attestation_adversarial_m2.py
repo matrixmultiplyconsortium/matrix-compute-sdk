@@ -140,14 +140,16 @@ def test_adversarial_intermediate_cert_signature_1bit_flip(verifier: Attestation
 
     # Rebuild cert with corrupted signature is represented by signing with wrong key
     wrong_key = generate_key("ecdsa", "secp384r1")
+    nvb = getattr(inter_cert, "not_valid_before_utc", getattr(inter_cert, "not_valid_before", None))
+    nva = getattr(inter_cert, "not_valid_after_utc", getattr(inter_cert, "not_valid_after", None))
     tampered_inter = (
         x509.CertificateBuilder()
         .subject_name(inter_cert.subject)
         .issuer_name(inter_cert.issuer)
         .public_key(inter_cert.public_key())
         .serial_number(inter_cert.serial_number)
-        .not_valid_before(inter_cert.not_valid_before_utc)
-        .not_valid_after(inter_cert.not_valid_after_utc)
+        .not_valid_before(nvb)
+        .not_valid_after(nva)
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
         .sign(wrong_key, hashes.SHA384())
     )
@@ -389,7 +391,7 @@ def test_adversarial_clock_skew_exact_stale_boundary(verifier: AttestationVerifi
     now = datetime.datetime.now(datetime.timezone.utc)
     exact_stale_ts = now.timestamp() - 300.0
 
-    ev = create_valid_attestation_evidence(pki=pki, nonce=nonce, timestamp=int(exact_stale_ts))
+    ev = create_valid_attestation_evidence(pki=pki, nonce=nonce, timestamp=exact_stale_ts)
     result = verifier.verify(evidence=ev, expected_nonce=nonce, verification_time=now)
     assert result.verified is True
 

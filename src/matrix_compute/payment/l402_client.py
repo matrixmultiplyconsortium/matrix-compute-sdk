@@ -776,8 +776,8 @@ class L402PaymentCoordinator:
             budget_controller
             if budget_controller is not None
             else BudgetController(
-                max_price_per_gflop=config.max_price_per_gflop if config else 0.001,
-                max_budget_sats=config.max_budget_sats if config else None,
+                max_price_per_gflop=getattr(config, "max_price_per_gflop", 0.001) if config else 0.001,
+                max_budget_sats=getattr(config, "max_budget_sats", None) if config else None,
             )
         )
         self.escrow_manager = (

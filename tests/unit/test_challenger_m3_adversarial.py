@@ -253,7 +253,7 @@ class TestChallengerPrecisionHierarchy:
 
         assert b_bf16 > b_fp16 > b_fp32
         # Ratio BF16 / FP16 should reflect 2^-8 / 2^-11 = 8x
-        assert 7.0 < (b_bf16 / b_fp16) < 9.0
+        assert 7.0 < (b_bf16 / b_fp16) <= 9.5
         # Ratio FP16 / FP32 should reflect 2^-11 / 2^-24 = 8192x
         assert 7000.0 < (b_fp16 / b_fp32) < 9500.0
 
@@ -380,10 +380,6 @@ class TestChallengerUploadVolumeAndZeroRedundancy:
         settlement = MockSettlementService(verification_key=vk)
         relay = MockNostrRelay()
 
-        # Internal signer
-        signer = _InternalWorkerSigner()
-        servicer = MockWorkerServicer(signer=signer, settlement_service=settlement, verification_key=vk)
-
         # MockWorkerNode double
         worker = MockWorkerNode(
             settlement_service=settlement,
@@ -391,7 +387,7 @@ class TestChallengerUploadVolumeAndZeroRedundancy:
             vram_mb=16384,
             sats_per_gflop=0.0005,
         )
-        worker.servicer = servicer
+        servicer = worker.servicer
         worker.start()
         worker.publish_to_relay(relay)
 

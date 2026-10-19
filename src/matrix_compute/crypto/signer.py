@@ -255,6 +255,8 @@ class ClientSigner:
         """Signs message with client's private key, returning 64-byte compact hex signature."""
         return sign_message(self._privkey_hex, message)
 
+    sign = sign_message
+
     def sign_result(self, task_id: str, result_hash_or_bytes: Union[str, bytes]) -> str:
         """Convenience method signing (task_id, SHA256(result_bytes)) tuple."""
         if isinstance(result_hash_or_bytes, (bytes, bytearray, memoryview)):

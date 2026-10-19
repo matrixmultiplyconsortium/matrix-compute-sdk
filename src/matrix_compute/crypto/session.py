@@ -196,6 +196,8 @@ def compute_ecdh_shared_secret(
             raise KeyExchangeError("X25519 produced all-zero shared secret (low-order point rejected)")
         return shared_secret
     except Exception as exc:
+        if "Null shared key" in str(exc) or "all-zero" in str(exc).lower():
+            raise KeyExchangeError("X25519 produced all-zero shared secret (low-order point rejected)") from exc
         raise KeyExchangeError(f"X25519 ECDH exchange failed: {exc}") from exc
 
 

@@ -369,7 +369,7 @@ def hermetic_iterative_env() -> Generator[Dict[str, Any], None, None]:
     )
 
     signer = ClientSigner(config.consumer_privkey_hex)
-    relay_client = RelayClient(relay_urls=config.nostr_relays, in_memory_relay=relay)
+    relay_client = RelayClient(relay_urls=config.nostr_relays, in_memory_relay=relay, offline_mock_mode=True)
     matchmaker = Matchmaker(
         min_vram_mb=config.min_worker_vram_mb,
         max_price_per_gflop=config.max_price_per_gflop,
@@ -722,7 +722,7 @@ class TestSuite6MultiPrecisionAndShapes:
             min_vram_mb=config.min_worker_vram_mb,
             max_price_per_gflop=config.max_price_per_gflop,
         )
-        relay_client = RelayClient(relay_urls=config.nostr_relays, in_memory_relay=env["relay"])
+        relay_client = RelayClient(relay_urls=config.nostr_relays, in_memory_relay=env["relay"], offline_mock_mode=True)
         escrow_manager = EscrowManager(
             settlement_backend=MockSettlementBackend(env["settlement"]),
             default_timeout_seconds=config.task_timeout_seconds,

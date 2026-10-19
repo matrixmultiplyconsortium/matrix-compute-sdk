@@ -27,6 +27,9 @@ class PartitioningStrategy(str, Enum):
     OUTER_PRODUCT_1D = "outer_product_1d"
     OUTPUT_GRID_2D = "output_grid_2d"
 
+    def __str__(self) -> str:
+        return str(self.value)
+
 
 class WorkloadType(str, Enum):
     """
@@ -40,6 +43,9 @@ class WorkloadType(str, Enum):
     GEMM_ONE_SHOT = "gemm_one_shot"
     ITERATIVE_POWER = "iterative_power"
     BATCH_STREAM = "batch_stream"
+
+    def __str__(self) -> str:
+        return str(self.value)
 
 
 class ClientConfig(BaseModel):
@@ -61,6 +67,7 @@ class ClientConfig(BaseModel):
     )
     min_worker_vram_mb: int = Field(4096, ge=512, description="Minimum worker VRAM in MB")
     max_price_per_gflop: float = Field(0.001, ge=0.0, description="Max acceptable price in sats/GFLOP")
+    max_budget_sats: Optional[int] = Field(None, ge=0, description="Maximum total satoshi budget allowance")
 
     # Settlement & L402 Settings
     settlement_api_url: str = Field(

@@ -1115,7 +1115,7 @@ class GrpcTaskDispatcher:
         details = rpc_err.details() if hasattr(rpc_err, "details") else str(rpc_err)
 
         if code == grpc.StatusCode.DEADLINE_EXCEEDED:
-            if stage == "RequestTileTask":
+            if stage in ("RequestTileTask", "LeaseMatrix"):
                 raise WorkerConnectionError(
                     f"Connection timeout during {stage} for task '{task_id}': {details}",
                     task_id=task_id,
@@ -1140,6 +1140,7 @@ class GrpcTaskDispatcher:
             grpc.StatusCode.PERMISSION_DENIED,
             grpc.StatusCode.UNAUTHENTICATED,
             grpc.StatusCode.FAILED_PRECONDITION,
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
         ):
             raise WorkerTaskRejectedError(
                 f"Worker rejected {stage} with {code}: {details}",

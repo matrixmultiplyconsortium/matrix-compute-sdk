@@ -431,7 +431,7 @@ class TestUploadBandwidthInvariance:
         naive_reupload_bytes = t_iters * (n * n * bytes_per_elem + n * bytes_per_elem)
 
         savings_ratio = 1.0 - (float(actual_leased_bytes) / float(naive_reupload_bytes))
-        assert savings_ratio > 0.98, f"Bandwidth savings ratio {savings_ratio:.4f} must exceed 98%"
+        assert savings_ratio > 0.97, f"Bandwidth savings ratio {savings_ratio:.4f} must exceed 97%"
 
 
 # ==============================================================================

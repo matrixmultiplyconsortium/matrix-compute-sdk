@@ -274,14 +274,18 @@ def test_adv_m4_04_batch_preimage_withholding_on_partial_passes():
         inspected_states: List[Dict[str, Any]] = []
 
         def inspecting_verify(*args, **kwargs):
-            # Check state of all active escrows during tile verification
-            for phash, esc in escrow_mgr._escrows.items():
-                inspected_states.append({
-                    "task_id": esc.task_id,
-                    "status": esc.status,
-                    "settlement_status": settlement.get_status(esc.payment_hash),
-                    "preimage_revealed": esc.status == EscrowStatus.SETTLED,
-                })
+            # Check state of the active batch escrow once per tile verification (skip full matrix Tier 2)
+            c_mat = kwargs.get("C", args[2] if len(args) > 2 else None)
+            if c_mat is not None and getattr(c_mat, "shape", None) == (16, 16):
+                tid = next(iter(escrow_mgr._by_payment_hash.values()), None)
+                unique_escrow = escrow_mgr.get_escrow(tid) if tid else None
+                if unique_escrow:
+                    inspected_states.append({
+                        "task_id": unique_escrow.task_id,
+                        "status": unique_escrow.status,
+                        "settlement_status": settlement.get_status(unique_escrow.payment_hash),
+                        "preimage_revealed": unique_escrow.status == EscrowStatus.SETTLED,
+                    })
             return original_verify(*args, **kwargs)
 
         coordinator.verifier.verify = inspecting_verify
@@ -523,7 +527,7 @@ def test_adv_m4_09_zero_satoshi_leakage_across_fees():
     for fee_pct in fee_percentages:
         for amount in test_amounts:
             resp = settlement.create_batch_escrow(
-                task_ids=[f"t_leak_{amount}_{int(fee_pct * 100)}"],
+                task_ids=[f"t_leak_{amount}_{fee_pct}"],
                 total_compute_sats=amount,
                 platform_fee_percent=fee_pct,
             )

@@ -261,14 +261,16 @@ def test_tampered_certificate_signature(verifier, default_pki) -> None:
     evidence = create_valid_attestation_evidence(pki=default_pki, nonce=nonce)
     rogue_key = generate_key("ecdsa", "secp384r1")
     leaf_cert = default_pki.leaf.cert
+    nvb = getattr(leaf_cert, "not_valid_before_utc", getattr(leaf_cert, "not_valid_before", None))
+    nva = getattr(leaf_cert, "not_valid_after_utc", getattr(leaf_cert, "not_valid_after", None))
     tampered_leaf = (
         x509.CertificateBuilder()
         .subject_name(leaf_cert.subject)
         .issuer_name(leaf_cert.issuer)
         .public_key(leaf_cert.public_key())
         .serial_number(leaf_cert.serial_number)
-        .not_valid_before(leaf_cert.not_valid_before_utc)
-        .not_valid_after(leaf_cert.not_valid_after_utc)
+        .not_valid_before(nvb)
+        .not_valid_after(nva)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(rogue_key, hashes.SHA384())
     )

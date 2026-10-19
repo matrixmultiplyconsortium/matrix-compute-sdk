@@ -7,6 +7,7 @@ import collections
 from concurrent import futures
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import math
@@ -355,6 +356,16 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
             except Exception:
                 pass
 
+        chunk_iter = iter(request_iterator)
+        first_chunk = None
+        try:
+            first_chunk = next(chunk_iter)
+        except StopIteration:
+            pass
+
+        if not task_id and first_chunk is not None:
+            task_id = first_chunk.task_id
+
         with self._lock:
             task_info = self._task_metadata.get(task_id or "")
 
@@ -389,8 +400,9 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         expected_seq = 0
         final_seen = False
 
+        chunks_to_process = itertools.chain([first_chunk], chunk_iter) if first_chunk is not None else []
         try:
-            for chunk in request_iterator:
+            for chunk in chunks_to_process:
                 if self.drop_connection:
                     if context:
                         context.abort(grpc.StatusCode.UNAVAILABLE, "Connection dropped mid-stream")

@@ -46,7 +46,7 @@ from matrix_contracts.v1 import (
 )
 from matrix_compute.client import MatrixComputeClient
 from matrix_compute.config import ClientConfig, WorkloadType
-from matrix_compute.crypto.signer import ClientSigner, generate_keypair
+from matrix_compute.crypto.signer import ClientSigner
 from matrix_compute.discovery.matchmaker import Matchmaker
 from matrix_compute.discovery.relay_client import RelayClient
 from matrix_compute.exceptions import (

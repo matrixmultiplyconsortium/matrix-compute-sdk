@@ -21,9 +21,11 @@ try:
 except ImportError:
     from matrix_contracts.v1 import pb2
 
-from matrix_compute.exceptions import (
+from matrix_compute.crypto.session import (
     DecryptionError,
     SecurityPolicyViolationError,
+)
+from matrix_compute.exceptions import (
     StreamingError,
     WorkerConnectionError,
     WorkerSignatureError,
@@ -31,8 +33,8 @@ from matrix_compute.exceptions import (
 )
 from matrix_compute.p2p.dispatcher import (
     GrpcTaskDispatcher,
+    IterativeSessionContext,
     IterativeStepResponseWrapper,
-    VramSessionMetadata,
 )
 from matrix_compute.test_doubles.mock_worker import (
     MockWorkerNode,
@@ -502,7 +504,7 @@ class TestDispatcherSignatureVerification:
         rather than attempting to validate over the ciphertext.
         """
         import secrets
-        from matrix_compute.crypto.aes_gcm import aes_gcm_encrypt
+        from matrix_compute.crypto.session import aes_gcm_encrypt
 
         signer = _InternalWorkerSigner()
         pubkey = signer.get_pubkey_hex()
@@ -512,8 +514,11 @@ class TestDispatcherSignatureVerification:
         # Create session with shared keys
         key_c2w = secrets.token_bytes(32)
         key_w2c = secrets.token_bytes(32)
-        session = VramSessionMetadata(
+        session = IterativeSessionContext(
             lease_id=lease_id,
+            rows=3,
+            cols=3,
+            dtype="fp32",
             is_confidential=True,
             k_c2w=key_c2w,
             k_w2c=key_w2c,
@@ -547,7 +552,7 @@ class TestDispatcherSignatureVerification:
             tag=enc.tag,
         )
 
-        fake_stub = type("FakeStub", (), {"StepIterative": lambda req, **kwargs: mock_response})()
+        fake_stub = type("FakeStub", (), {"StepIterative": lambda *args, **kwargs: mock_response})()
         orig_get_stub = dispatcher.channel_pool.get_stub
         dispatcher.channel_pool.get_stub = lambda target: fake_stub
 
