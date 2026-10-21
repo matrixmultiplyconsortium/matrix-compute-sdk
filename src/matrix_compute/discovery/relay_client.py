@@ -610,15 +610,19 @@ class RelayClient:
                             # Live relay query requires websockets library
                             try:
                                 import websockets  # noqa: F401
-                                raise RelayConnectionError(
-                                    f"Live WebSocket subscription not implemented for {target}; use MockNostrRelay or install live adapter",
-                                    relay_url=target,
-                                )
-                            except ImportError:
+                            except ImportError as ex:
                                 raise RelayConnectionError(
                                     f"Live relay transport requires 'websockets' library; install websockets to query {target}",
                                     relay_url=target,
-                                )
+                                ) from ex
+
+                            try:
+                                node_events = self._query_websocket_url(target)
+                            except Exception as ws_ex:
+                                raise RelayConnectionError(
+                                    f"Live WebSocket subscription failed for {target}: {ws_ex}",
+                                    relay_url=target,
+                                ) from ws_ex
 
                     for ev in node_events:
                         raw_events.append((ev, str(target)))
@@ -775,6 +779,49 @@ class RelayClient:
                     )
 
         return event_id
+
+    def _query_websocket_url(self, ws_url: str, kind: int = 30000) -> List[Dict[str, Any]]:
+        """Connects to a live Nostr WebSocket relay, subscribes to Kind 30000, and returns events until EOSE."""
+        import asyncio
+        import concurrent.futures
+        import uuid
+        import websockets
+
+        async def _fetch() -> List[Dict[str, Any]]:
+            sub_id = f"sub_{uuid.uuid4().hex[:8]}"
+            events: List[Dict[str, Any]] = []
+            async with websockets.connect(ws_url, ping_interval=None, open_timeout=self.timeout) as ws:
+                await ws.send(json.dumps(["REQ", sub_id, {"kinds": [kind]}]))
+                deadline = time.time() + self.timeout
+                while time.time() < deadline:
+                    remaining = max(deadline - time.time(), 0.1)
+                    try:
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                        msg = json.loads(raw_msg)
+                        if not isinstance(msg, list) or not msg:
+                            continue
+                        verb = msg[0]
+                        if verb == "EVENT" and len(msg) >= 3 and msg[1] == sub_id:
+                            events.append(msg[2])
+                        elif verb == "EOSE" and len(msg) >= 2 and msg[1] == sub_id:
+                            break
+                    except (asyncio.TimeoutError, TimeoutError):
+                        break
+                try:
+                    await ws.send(json.dumps(["CLOSE", sub_id]))
+                except Exception:
+                    pass
+            return events
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(lambda: asyncio.run(_fetch())).result()
+        return asyncio.run(_fetch())
 
     def clear_cache(self) -> None:
         """Purges in-memory announcement cache."""

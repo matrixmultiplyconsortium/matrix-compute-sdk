@@ -112,11 +112,10 @@ class ChannelPool:
         return [
             ("grpc.max_receive_message_length", self.max_message_bytes),
             ("grpc.max_send_message_length", self.max_message_bytes),
-            ("grpc.keepalive_time_ms", 30000),
-            ("grpc.keepalive_timeout_ms", 10000),
-            ("grpc.keepalive_permit_without_calls", 1),
+            ("grpc.keepalive_time_ms", 120000),
+            ("grpc.keepalive_timeout_ms", 60000),
+            ("grpc.keepalive_permit_without_calls", 0),
             ("grpc.http2.max_pings_without_data", 0),
-            ("grpc.http2.min_time_between_pings_ms", 10000),
         ]
 
     def get_channel(

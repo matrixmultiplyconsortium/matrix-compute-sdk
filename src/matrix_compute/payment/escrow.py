@@ -572,6 +572,17 @@ class EscrowManager:
             try:
                 if self.lnd_payer is not None and escrow.payment_request:
                     self.lnd_payer.pay_invoice(escrow.payment_request)
+                    # Over WAN / Mutinynet, wait briefly for settlement node to observe ACCEPTED/HELD
+                    if hasattr(self.settlement_backend, "get_status"):
+                        poll_deadline = time.time() + 5.0
+                        while time.time() < poll_deadline:
+                            try:
+                                st = self.settlement_backend.get_status(escrow.payment_hash)
+                                if st is None or str(st).strip().upper() == "HELD":
+                                    break
+                            except Exception:
+                                break
+                            time.sleep(0.1)
                 else:
                     self.settlement_backend.hold_invoice(escrow.payment_hash)
             except Exception as ex:

@@ -150,57 +150,114 @@ class LndPayer:
         }
 
         client = self.get_client()
-        try:
-            # POST /v2/router/send can stream payment updates as chunked JSON
-            req = client.build_request("POST", "/v2/router/send", json=payload)
-            resp = client.send(req, stream=True)
+        ready_event = threading.Event()
+        result_box: Dict[str, Any] = {"update": None, "error": None}
 
-            if resp.status_code not in (200, 201):
-                resp.read()
-                raise PaymentError(f"LND SendPaymentV2 HTTP error {resp.status_code}: {resp.text}")
+        def _stream_reader() -> None:
+            try:
+                req = client.build_request("POST", "/v2/router/send", json=payload)
+                resp = client.send(req, stream=True)
 
-            payment_info: Dict[str, Any] = {}
-            for line in resp.iter_lines():
-                if not line:
-                    continue
+                if resp.status_code not in (200, 201):
+                    resp.read()
+                    result_box["error"] = PaymentError(
+                        f"LND SendPaymentV2 HTTP error {resp.status_code}: {resp.text}"
+                    )
+                    resp.close()
+                    ready_event.set()
+                    return
+
+                payment_info: Dict[str, Any] = {}
                 try:
-                    update = json.loads(line)
-                except Exception:
-                    continue
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            raw_obj = json.loads(line)
+                        except Exception:
+                            continue
 
-                status = str(update.get("status", "")).upper()
-                payment_hash = update.get("payment_hash", "")
-                payment_info = update
+                        if isinstance(raw_obj, dict) and "error" in raw_obj and raw_obj["error"]:
+                            result_box["error"] = PaymentError(
+                                f"LND SendPaymentV2 stream error: {raw_obj['error']}"
+                            )
+                            ready_event.set()
+                            return
 
-                # For HODL invoices, IN_FLIGHT means the HTLC is actively held!
-                if status == "IN_FLIGHT":
-                    with self._lock:
-                        self._in_flight_payments[clean_pr] = update
-                    if wait_for_in_flight:
-                        resp.close()
-                        return update
+                        update = (
+                            raw_obj.get("result", raw_obj)
+                            if isinstance(raw_obj, dict)
+                            else raw_obj
+                        )
+                        if not isinstance(update, dict):
+                            continue
 
-                elif status == "SUCCEEDED":
-                    with self._lock:
-                        self._in_flight_payments[clean_pr] = update
+                        status = str(update.get("status", "")).upper()
+                        payment_info = update
+
+                        if status == "IN_FLIGHT":
+                            with self._lock:
+                                self._in_flight_payments[clean_pr] = update
+                            if result_box["update"] is None:
+                                result_box["update"] = update
+                            if wait_for_in_flight:
+                                ready_event.set()
+
+                        elif status == "SUCCEEDED":
+                            with self._lock:
+                                self._in_flight_payments[clean_pr] = update
+                            result_box["update"] = update
+                            ready_event.set()
+                            return
+
+                        elif status == "FAILED":
+                            failure_reason = update.get("failure_reason", "UNKNOWN_FAILURE")
+                            result_box["error"] = PaymentError(
+                                f"LND payment failed with status {status}: {failure_reason}"
+                            )
+                            ready_event.set()
+                            return
+                finally:
                     resp.close()
-                    return update
 
-                elif status == "FAILED":
-                    failure_reason = update.get("failure_reason", "UNKNOWN_FAILURE")
-                    resp.close()
-                    raise PaymentError(f"LND payment failed with status {status}: {failure_reason}")
+                if not ready_event.is_set():
+                    if payment_info:
+                        result_box["update"] = payment_info
+                    else:
+                        result_box["error"] = PaymentError(
+                            f"LND SendPaymentV2 closed stream without yielding payment confirmation for {clean_pr[:20]}..."
+                        )
+                    ready_event.set()
 
-            resp.close()
-            if payment_info:
-                return payment_info
+            except httpx.HTTPError as ex:
+                if not ready_event.is_set():
+                    result_box["error"] = PaymentError(
+                        f"Network error communicating with Consumer LND: {ex}"
+                    )
+                    ready_event.set()
+            except Exception as ex:
+                if not ready_event.is_set():
+                    result_box["error"] = PaymentError(
+                        f"Unexpected error communicating with Consumer LND: {ex}"
+                    )
+                    ready_event.set()
 
+        reader_thread = threading.Thread(
+            target=_stream_reader,
+            daemon=True,
+            name=f"lnd-send-{clean_pr[-8:]}",
+        )
+        reader_thread.start()
+
+        if not ready_event.wait(timeout=float(timeout) + 5.0):
             raise PaymentError(
-                f"LND SendPaymentV2 closed stream without yielding payment confirmation for {clean_pr[:20]}..."
+                f"Timed out waiting {timeout}s for Consumer LND payment status on {clean_pr[:20]}..."
             )
 
-        except httpx.HTTPError as ex:
-            raise PaymentError(f"Network error communicating with Consumer LND: {ex}") from ex
+        if result_box["error"] is not None:
+            raise result_box["error"]
+
+        return result_box["update"] or {}
 
     def get_payment_status(self, payment_hash_or_request: str) -> Optional[str]:
         """
@@ -211,3 +268,82 @@ class LndPayer:
             if info:
                 return str(info.get("status", "")).upper()
         return None
+
+    def get_info(self) -> Dict[str, Any]:
+        """Queries Consumer LND node info via GET /v1/getinfo."""
+        client = self.get_client()
+        resp = client.get("/v1/getinfo")
+        resp.raise_for_status()
+        return resp.json()
+
+    def connect_peer(self, pubkey_hex: str, host_port: str, perm: bool = True) -> Dict[str, Any]:
+        """Idempotently connects Consumer LND to a remote Lightning peer via POST /v1/peers."""
+        clean_pk = pubkey_hex.strip().lower()
+        client = self.get_client()
+        peers_resp = client.get("/v1/peers")
+        if peers_resp.status_code == 200:
+            for p in peers_resp.json().get("peers", []):
+                if str(p.get("pub_key", "")).lower() == clean_pk:
+                    return {"status": "ALREADY_CONNECTED", "pub_key": clean_pk}
+
+        payload = {"addr": {"pubkey": clean_pk, "host": host_port.strip()}, "perm": perm}
+        resp = client.post("/v1/peers", json=payload)
+        if resp.status_code in (200, 201) or "already connected" in resp.text.lower():
+            return {"status": "CONNECTED", "pub_key": clean_pk}
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_channels(self, peer_pubkey_hex: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Lists open channels on Consumer LND via GET /v1/channels."""
+        client = self.get_client()
+        resp = client.get("/v1/channels")
+        resp.raise_for_status()
+        channels = list(resp.json().get("channels", []))
+        if peer_pubkey_hex:
+            target = peer_pubkey_hex.strip().lower()
+            channels = [
+                ch for ch in channels
+                if str(ch.get("remote_pubkey", "")).lower() == target
+            ]
+        return channels
+
+    def open_channel(
+        self,
+        node_pubkey_hex: str,
+        local_funding_amount: int = 100_000,
+        push_sat: int = 0,
+        min_confs: int = 1,
+        sat_per_vbyte: int = 1,
+        spend_unconfirmed: bool = True,
+    ) -> Dict[str, Any]:
+        """Opens a new Lightning channel from Consumer LND to Settlement LND via POST /v1/channels."""
+        client = self.get_client()
+        payload = {
+            "node_pubkey_string": node_pubkey_hex.strip(),
+            "local_funding_amount": str(int(local_funding_amount)),
+            "push_sat": str(int(push_sat)),
+            "min_confs": int(min_confs),
+            "sat_per_vbyte": str(int(sat_per_vbyte)),
+            "spend_unconfirmed": bool(spend_unconfirmed),
+        }
+        resp = client.post("/v1/channels", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def ensure_channel_to_peer(
+        self,
+        peer_pubkey_hex: str,
+        peer_host_port: Optional[str] = None,
+        capacity_sats: int = 100_000,
+        min_outbound_sats: int = 5_000,
+    ) -> Dict[str, Any]:
+        """Ensures Consumer LND has an open or pending channel to Settlement LND."""
+        clean_pk = peer_pubkey_hex.strip().lower()
+        if peer_host_port:
+            self.connect_peer(clean_pk, peer_host_port)
+        existing = self.list_channels(peer_pubkey_hex=clean_pk)
+        for ch in existing:
+            if int(ch.get("local_balance", 0)) >= min_outbound_sats:
+                return {"status": "ACTIVE" if ch.get("active") else "INACTIVE", "channel": ch}
+        funding = self.open_channel(node_pubkey_hex=clean_pk, local_funding_amount=capacity_sats)
+        return {"status": "OPENING", "funding": funding}
