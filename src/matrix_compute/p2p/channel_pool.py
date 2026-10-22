@@ -82,6 +82,46 @@ def parse_multiaddr(endpoint: Union[str, Any]) -> str:
 multiaddr_to_target = parse_multiaddr
 
 
+def extract_circuit_target_worker(endpoint: Union[str, Any]) -> Optional[str]:
+    """
+    Extracts the target worker pubkey from a circuit multiaddr if present.
+    Example:
+      '/dns4/relay.local/tcp/9090/p2p-circuit/p2p/<pubkey>' -> '<pubkey>'
+      '/ip4/127.0.0.1/tcp/9090/p2p-circuit/p2p/<pubkey>' -> '<pubkey>'
+    """
+    if endpoint is None:
+        return None
+
+    if not isinstance(endpoint, str):
+        if hasattr(endpoint, "worker_pubkey") and endpoint.worker_pubkey:
+            return str(endpoint.worker_pubkey).strip().lower()
+        if hasattr(endpoint, "p2p_multiaddr") and endpoint.p2p_multiaddr:
+            endpoint = endpoint.p2p_multiaddr
+        elif hasattr(endpoint, "multiaddr") and endpoint.multiaddr:
+            endpoint = endpoint.multiaddr
+        else:
+            endpoint = str(endpoint)
+
+    clean = str(endpoint).strip()
+    m = re.search(r"/p2p-circuit/p2p/([a-fA-F0-9]+)", clean)
+    if m:
+        return m.group(1).lower()
+
+    m2 = re.search(r"/p2p/([a-fA-F0-9]+)", clean)
+    if m2 and "p2p-circuit" in clean:
+        return m2.group(1).lower()
+
+    return None
+
+
+def is_circuit_multiaddr(endpoint: Union[str, Any]) -> bool:
+    """Returns True if endpoint represents a libp2p circuit relay multiaddr."""
+    if endpoint is None:
+        return False
+    clean = str(getattr(endpoint, "p2p_multiaddr", None) or getattr(endpoint, "multiaddr", None) or endpoint)
+    return "p2p-circuit" in clean
+
+
 class ChannelPool:
     """
     Thread-safe cache of gRPC Channels and MatrixComputeService stubs.

@@ -55,7 +55,11 @@ from matrix_compute.exceptions import (
     WorkerSignatureError,
     WorkerTaskRejectedError,
 )
-from matrix_compute.p2p.channel_pool import ChannelPool, parse_multiaddr
+from matrix_compute.p2p.channel_pool import (
+    ChannelPool,
+    extract_circuit_target_worker,
+    parse_multiaddr,
+)
 from matrix_compute.tiling.partitioner import TileTaskPlan
 from matrix_compute.tiling.precision import get_bytes_per_element, get_numpy_dtype, normalize_dtype
 
@@ -174,6 +178,33 @@ class GrpcTaskDispatcher:
         self._iterative_sessions: Dict[str, IterativeSessionContext] = {}
         self._sessions_lock = threading.Lock()
 
+    def _build_metadata(
+        self,
+        task_or_lease_id: str,
+        auth_header: Optional[str] = None,
+        worker_pubkey: str = "",
+        worker_or_target: Any = None,
+        is_lease: bool = False,
+        extra_metadata: Optional[List[Tuple[str, str]]] = None,
+    ) -> List[Tuple[str, str]]:
+        key_name = "x-lease-id" if is_lease else "x-task-id"
+        meta = [(key_name, str(task_or_lease_id).strip())]
+        if is_lease:
+            meta.append(("x-task-id", str(task_or_lease_id).strip()))
+        target_worker = (
+            worker_pubkey
+            or (extract_circuit_target_worker(worker_or_target) if worker_or_target else "")
+            or getattr(worker_or_target, "worker_pubkey", "")
+            or getattr(worker_or_target, "pubkey", "")
+        )
+        if target_worker:
+            meta.append(("x-target-worker", str(target_worker).strip().lower()))
+        if auth_header:
+            meta.append(("authorization", auth_header.strip()))
+        if extra_metadata:
+            meta.extend(extra_metadata)
+        return meta
+
     def request_tile_task(
         self,
         worker_or_target: Union[str, Any],
@@ -232,8 +263,17 @@ class GrpcTaskDispatcher:
             )
 
         eff_timeout = timeout if timeout is not None else self.connect_timeout
+        metadata = self._build_metadata(
+            task_id,
+            worker_pubkey=worker_pubkey,
+            worker_or_target=worker_or_target,
+            is_lease=False,
+        )
         try:
-            ack = stub.RequestTileTask(req, timeout=eff_timeout)
+            try:
+                ack = stub.RequestTileTask(req, metadata=metadata, timeout=eff_timeout)
+            except TypeError:
+                ack = stub.RequestTileTask(req, timeout=eff_timeout)
         except grpc.RpcError as rpc_err:
             self._handle_rpc_error(rpc_err, task_id, "RequestTileTask", worker_pubkey=worker_pubkey, multiaddr=target)
 
@@ -578,9 +618,13 @@ class GrpcTaskDispatcher:
         with self._sessions_lock:
             session = self._sessions.get(task_id)
 
-        metadata: List[Tuple[str, str]] = [("x-task-id", task_id)]
-        if auth_header:
-            metadata.append(("authorization", auth_header.strip()))
+        metadata = self._build_metadata(
+            task_id,
+            auth_header=auth_header,
+            worker_pubkey=worker_pubkey,
+            worker_or_target=worker_or_target,
+            is_lease=False,
+        )
 
         eff_timeout = timeout if timeout is not None else self.task_timeout
         try:
@@ -628,7 +672,12 @@ class GrpcTaskDispatcher:
         Executes a tile computation task matching PROJECT.md interface contract:
         execute_tile(worker: MatchedWorker, task_id: str, A_tile: np.ndarray, B_tile: np.ndarray, dtype: str, l402_header: str) -> TileResult
         """
-        pubkey = worker_pubkey or getattr(worker, "worker_pubkey", getattr(worker, "pubkey", ""))
+        pubkey = (
+            worker_pubkey
+            or getattr(worker, "worker_pubkey", getattr(worker, "pubkey", ""))
+            or (extract_circuit_target_worker(worker) if worker else "")
+            or ""
+        )
         m, k = A_tile.shape
         _, n = B_tile.shape
         target_dtype = normalize_dtype(dtype)
@@ -820,9 +869,13 @@ class GrpcTaskDispatcher:
             client_ephemeral_pubkey=client_pub_bytes,
         )
 
-        metadata: List[Tuple[str, str]] = [("x-lease-id", str(lease_id).strip())]
-        if auth_header:
-            metadata.append(("authorization", auth_header.strip()))
+        metadata = self._build_metadata(
+            lease_id,
+            auth_header=auth_header,
+            worker_pubkey=worker_pubkey,
+            worker_or_target=worker_or_target,
+            is_lease=True,
+        )
 
         eff_timeout = timeout if timeout is not None else self.task_timeout
 
@@ -934,12 +987,14 @@ class GrpcTaskDispatcher:
             tag=tag,
         )
 
-        metadata: List[Tuple[str, str]] = [
-            ("x-lease-id", str(lease_id).strip()),
-            ("x-step-index", str(step_index)),
-        ]
-        if auth_header:
-            metadata.append(("authorization", auth_header.strip()))
+        metadata = self._build_metadata(
+            lease_id,
+            auth_header=auth_header,
+            worker_pubkey=worker_pubkey,
+            worker_or_target=worker_or_target,
+            is_lease=True,
+            extra_metadata=[("x-step-index", str(step_index))],
+        )
 
         eff_timeout = timeout if timeout is not None else self.task_timeout
 
@@ -1053,9 +1108,13 @@ class GrpcTaskDispatcher:
             reason=str(reason).strip(),
         )
 
-        metadata: List[Tuple[str, str]] = [("x-lease-id", str(lease_id).strip())]
-        if auth_header:
-            metadata.append(("authorization", auth_header.strip()))
+        metadata = self._build_metadata(
+            lease_id,
+            auth_header=auth_header,
+            worker_pubkey=worker_pubkey,
+            worker_or_target=worker_or_target,
+            is_lease=True,
+        )
 
         eff_timeout = timeout if timeout is not None else self.connect_timeout
 

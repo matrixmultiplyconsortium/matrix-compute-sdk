@@ -281,6 +281,9 @@ class NvidiaCcaVerifier(BaseEvidenceVerifier):
 # MAIN ATTESTATION VERIFIER ENGINE (F10, F11, F12, F13)
 # ==============================================================================
 
+from .sev_snp_verifier import AmdSevSnpVerifier
+
+
 class AttestationVerifier:
     """
     Production-grade Attestation Verification Engine for matrix-compute-sdk.
@@ -293,6 +296,7 @@ class AttestationVerifier:
         # Register default strategies
         self.register_provider(SimulatedCcaVerifier())
         self.register_provider(NvidiaCcaVerifier())
+        self.register_provider(AmdSevSnpVerifier())
 
     def register_provider(self, verifier: BaseEvidenceVerifier) -> None:
         """Registers a pluggable attestation evidence verification strategy."""
@@ -705,6 +709,10 @@ class AttestationVerifier:
 
             actual_val = str(actual_measurements[key]).strip().lower()
             expected_val = str(expected_digest).strip().lower()
+            if actual_val.startswith("0x"):
+                actual_val = actual_val[2:]
+            if expected_val.startswith("0x"):
+                expected_val = expected_val[2:]
 
             if not secrets.compare_digest(actual_val, expected_val):
                 mismatches[key] = {"expected": expected_val, "actual": actual_val}
