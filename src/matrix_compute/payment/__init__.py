@@ -12,6 +12,7 @@ from .l402_client import (
     BudgetController,
     HttpSettlementBackend,
     L402Challenge,
+    L402PaymentClient,
     L402PaymentCoordinator,
     MacaroonCaveats,
     MacaroonToken,
@@ -38,6 +39,7 @@ __all__ = [
     "format_grpc_metadata",
     # Budget & Coordinator
     "BudgetController",
+    "L402PaymentClient",
     "L402PaymentCoordinator",
     "MockSettlementBackend",
     "HttpSettlementBackend",

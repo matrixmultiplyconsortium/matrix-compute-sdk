@@ -227,6 +227,11 @@ class ClientSigner:
         self._xonly_pubkey_hex = pubkey_to_xonly(self._pubkey_hex_compressed)
         self._npub = pubkey_to_npub(self._xonly_pubkey_hex)
 
+    @classmethod
+    def generate(cls) -> "ClientSigner":
+        """Generates a fresh random ClientSigner instance."""
+        return cls()
+
     def get_privkey_hex(self) -> str:
         """Returns 32-byte hex private key (64 chars)."""
         return self._privkey_hex

@@ -65,7 +65,7 @@ class VerificationPolicy:
 
     def add_trusted_root_pem(self, pem_str: str) -> None:
         """Parses and appends a PEM-encoded X.509 certificate to trusted roots."""
-        cert = x509.load_pem_x509_certificate(pem_str.encode("utf-8"))
+        cert = x509.load_pem_x509_certificate(pem_str.strip().encode("utf-8"))
         self.trusted_roots.append(cert)
 
     def add_golden_rim(self, provider_or_model: str, rim_manifest: Dict[str, str]) -> None:
@@ -282,6 +282,7 @@ class NvidiaCcaVerifier(BaseEvidenceVerifier):
 # ==============================================================================
 
 from .sev_snp_verifier import AmdSevSnpVerifier
+from .tdx_verifier import IntelTdxVerifier
 
 
 class AttestationVerifier:
@@ -297,6 +298,7 @@ class AttestationVerifier:
         self.register_provider(SimulatedCcaVerifier())
         self.register_provider(NvidiaCcaVerifier())
         self.register_provider(AmdSevSnpVerifier())
+        self.register_provider(IntelTdxVerifier())
 
     def register_provider(self, verifier: BaseEvidenceVerifier) -> None:
         """Registers a pluggable attestation evidence verification strategy."""
@@ -400,7 +402,7 @@ class AttestationVerifier:
         # Parse and check individual certificate validity dates
         for idx, pem_str in enumerate(chain_pems):
             try:
-                cert = x509.load_pem_x509_certificate(pem_str.encode("utf-8"))
+                cert = x509.load_pem_x509_certificate(pem_str.strip().encode("utf-8"))
             except Exception as exc:
                 raise AttestationCertificateError(
                     f"Failed to parse PEM certificate at index {idx}: {exc}",

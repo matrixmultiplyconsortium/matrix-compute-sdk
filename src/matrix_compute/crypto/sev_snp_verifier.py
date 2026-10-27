@@ -426,7 +426,7 @@ class AmdSevSnpVerifier(BaseEvidenceVerifier):
         if evidence.certificate_chain:
             try:
                 leaf_pem = evidence.certificate_chain[0]
-                leaf_cert = x509.load_pem_x509_certificate(leaf_pem.encode("utf-8"))
+                leaf_cert = x509.load_pem_x509_certificate(leaf_pem.strip().encode("utf-8"))
                 vcek_exts = parse_vcek_extensions(leaf_cert)
                 if vcek_exts:
                     claims["vcek_extensions"] = vcek_exts

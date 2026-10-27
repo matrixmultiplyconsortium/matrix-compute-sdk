@@ -488,8 +488,19 @@ class BudgetController:
 class MockSettlementBackend:
     """Settlement backend wrapper targeting in-memory MockSettlementService."""
 
-    def __init__(self, service: Optional[MockSettlementService] = None) -> None:
-        self.service = service if service is not None else MockSettlementService()
+    def __init__(
+        self,
+        service: Optional[MockSettlementService] = None,
+        verification_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        if service is not None:
+            self.service = service
+        elif verification_key is not None:
+            self.service = MockSettlementService(verification_key=verification_key)
+        else:
+            self.service = MockSettlementService()
+        self.verification_key = verification_key or getattr(self.service, "verification_key", None)
 
     def create_hodl_invoice(
         self,
@@ -918,3 +929,63 @@ class L402PaymentCoordinator:
         self.escrow_manager.abort_and_refund(tid, reason=reason)
         self.budget_controller.release(tid)
         return True
+
+
+class L402PaymentClient:
+    """
+    Client for minting, managing, and verifying L402 payment credentials and macaroons.
+    """
+
+    def __init__(
+        self,
+        settlement_backend: Optional[Any] = None,
+        macaroon_caveat_secret: Optional[str] = None,
+        verification_key: Optional[str] = None,
+    ) -> None:
+        self.settlement_backend = settlement_backend
+        self.macaroon_caveat_secret = (
+            macaroon_caveat_secret
+            or verification_key
+            or (getattr(settlement_backend, "verification_key", None) if settlement_backend else None)
+            or "settlement_secret_key_dev"
+        )
+
+    def mint_macaroon(
+        self,
+        task_id: str,
+        payment_hash: str,
+        m: int = 2,
+        k: int = 2,
+        n: int = 2,
+        locked_sats: int = 100,
+        max_gflops: Optional[float] = None,
+        expiry: Optional[int] = None,
+        task_ids: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Mints a valid HMAC-SHA256 signed L402 Macaroon token for a matrix compute workload.
+        """
+        calc_gflops = (2.0 * m * k * n) / 1e9
+        effective_gflops = max_gflops if max_gflops is not None else max(100.0, calc_gflops * 10.0)
+        exp = int(expiry if expiry is not None else (time.time() + 3600))
+
+        caveats: Dict[str, Any] = {
+            "expiry": exp,
+            "locked_sats": locked_sats,
+            "max_gflops": float(effective_gflops),
+            "payment_hash": payment_hash,
+            "task_id": task_id,
+        }
+        if task_ids is not None:
+            caveats["task_ids"] = list(task_ids)
+
+        caveat_str = json.dumps(caveats, sort_keys=True)
+        sig = hmac.new(
+            self.macaroon_caveat_secret.encode("utf-8"),
+            caveat_str.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        payload = {"caveats": caveats, "signature": sig}
+        return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
+
