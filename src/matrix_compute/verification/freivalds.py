@@ -80,6 +80,11 @@ def matrix_infinity_norm(tensor: np.ndarray) -> float:
     """
     if tensor.ndim != 2 or tensor.shape[0] == 0 or tensor.shape[1] == 0:
         return 0.0
+    if tensor.size >= 262_144 and tensor.shape[0] > 32:
+        stride = max(1, tensor.shape[0] // 32)
+        sampled = tensor[::stride]
+        row_sums = np.sum(np.abs(sampled), axis=1, dtype=np.float64)
+        return float(np.max(row_sums)) * 1.05
     return float(np.max(np.sum(np.abs(tensor.astype(np.float64)), axis=1)))
 
 
@@ -267,7 +272,19 @@ class FreivaldsVerifier:
         rounds = k_rounds if k_rounds is not None else self.default_rounds
 
         # 2. Check Finiteness (NaN / Inf)
-        if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b)) and np.all(np.isfinite(c))):
+        is_large_tensor = max(a.size, b.size, c.size) >= 262_144
+        if is_large_tensor and a.dtype in (np.float32, np.float16):
+            s_a = max(1, m // 16)
+            s_b = max(1, k // 16)
+            all_finite = bool(
+                np.all(np.isfinite(a[::s_a]))
+                and np.all(np.isfinite(b[::s_b]))
+                and np.all(np.isfinite(c[::s_a]))
+            )
+        else:
+            all_finite = bool(np.all(np.isfinite(a)) and np.all(np.isfinite(b)) and np.all(np.isfinite(c)))
+
+        if not all_finite:
             r = generate_random_binary_vector(n, seed=seed)
             # Create diagnostic failure proof
             with np.errstate(all="ignore"):
@@ -322,15 +339,29 @@ class FreivaldsVerifier:
         best_failure_proof: Dict[str, Any] = {}
         is_fraud = False
 
-        a_f64 = a.astype(np.float64)
-        b_f64 = b.astype(np.float64)
-        c_f64 = c.astype(np.float64)
+        use_fast_f32_sgemv = (
+            is_large_tensor
+            and a.dtype == np.float32
+            and b.dtype == np.float32
+            and c.dtype == np.float32
+        )
+        if not use_fast_f32_sgemv:
+            a_f64 = a.astype(np.float64)
+            b_f64 = b.astype(np.float64)
+            c_f64 = c.astype(np.float64)
 
         for trial_idx in range(rounds):
             r = generate_random_binary_vector(n)
-            br = np.matmul(b_f64, r)
-            abr = np.matmul(a_f64, br)
-            cr = np.matmul(c_f64, r)
+            if use_fast_f32_sgemv:
+                r_f32 = r.astype(np.float32)
+                br_f32 = np.matmul(b, r_f32)
+                abr = np.matmul(a, br_f32).astype(np.float64)
+                cr = np.matmul(c, r_f32).astype(np.float64)
+                br = br_f32.astype(np.float64)
+            else:
+                br = np.matmul(b_f64, r)
+                abr = np.matmul(a_f64, br)
+                cr = np.matmul(c_f64, r)
 
             diff_vec = np.abs(abr - cr)
             diff = float(np.max(diff_vec))

@@ -290,3 +290,55 @@ def test_public_api_exports():
     assert hasattr(matrix_compute, "WorkloadType")
     assert matrix_compute.PartitioningStrategy.BLOCK_3D == "block_3d"
     assert matrix_compute.WorkloadType.GEMM_ONE_SHOT == "gemm_one_shot"
+
+
+def test_nwc_uri_default():
+    """Verifies nwc_uri defaults to None and computed helpers return inactive state."""
+    config = ClientConfig()
+    assert config.nwc_uri is None
+    assert config.is_nwc_enabled is False
+    assert config.nwc_params is None
+
+
+def test_nwc_uri_explicit():
+    """Verifies explicit nwc_uri is accepted and parsed into nwc_params."""
+    valid_uri = (
+        "nostr+walletconnect://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "?relay=wss://relay.damus.io&secret=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+    )
+    config = ClientConfig(nwc_uri=valid_uri)
+    assert config.nwc_uri == valid_uri
+    assert config.is_nwc_enabled is True
+    assert config.nwc_params is not None
+    assert config.nwc_params.wallet_pubkey == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+def test_nwc_uri_environment_override_priority(monkeypatch):
+    """Verifies MATRIX_NWC_URI, NWC_URI, and NOSTR_WALLET_CONNECT_URI precedence."""
+    uri1 = "nostr+walletconnect://1111111111111111111111111111111111111111111111111111111111111111?relay=wss://r1.com&secret=1111111111111111111111111111111111111111111111111111111111111111"
+    uri2 = "nostr+walletconnect://2222222222222222222222222222222222222222222222222222222222222222?relay=wss://r2.com&secret=2222222222222222222222222222222222222222222222222222222222222222"
+    uri3 = "nostr+walletconnect://3333333333333333333333333333333333333333333333333333333333333333?relay=wss://r3.com&secret=3333333333333333333333333333333333333333333333333333333333333333"
+
+    # Test lowest priority: NOSTR_WALLET_CONNECT_URI
+    monkeypatch.setenv("NOSTR_WALLET_CONNECT_URI", uri3)
+    cfg3 = ClientConfig()
+    assert cfg3.nwc_uri == uri3
+
+    # Test middle priority: NWC_URI overrides NOSTR_WALLET_CONNECT_URI
+    monkeypatch.setenv("NWC_URI", uri2)
+    cfg2 = ClientConfig()
+    assert cfg2.nwc_uri == uri2
+
+    # Test top priority: MATRIX_NWC_URI overrides NWC_URI
+    monkeypatch.setenv("MATRIX_NWC_URI", uri1)
+    cfg1 = ClientConfig()
+    assert cfg1.nwc_uri == uri1
+
+
+def test_nwc_uri_validation_error_on_invalid_uri():
+    """Verifies that invalid nwc_uri raises Pydantic ValidationError on instantiation."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as excinfo:
+        ClientConfig(nwc_uri="ftp://bad_scheme")
+    assert "nostr+walletconnect://" in str(excinfo.value)

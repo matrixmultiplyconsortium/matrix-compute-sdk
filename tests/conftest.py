@@ -382,6 +382,8 @@ class MockSettlementDouble:
         payment_hash: Optional[str] = None,
         max_gflops: float = 100.0,
         expiry_seconds: int = 3600,
+        platform_fee_percent: float = 0.05,
+        **kwargs: Any,
     ) -> CreateHodlInvoiceResponse:
         if task_id in self._task_index:
             raise ValueError(f"Task '{task_id}' already registered to invoice '{self._task_index[task_id]}'")
@@ -406,7 +408,7 @@ class MockSettlementDouble:
             payment_hash=final_hash,
         )
 
-        fee_sats = int(round(total_compute_sats * 0.02))
+        fee_sats = int(round(total_compute_sats * platform_fee_percent))
         payout_sats = total_compute_sats - fee_sats
 
         record = {

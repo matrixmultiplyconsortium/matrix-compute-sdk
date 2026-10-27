@@ -100,6 +100,7 @@ class DiscoveredWorker:
             lightning_routing_pubkey=self.lightning_address,
             reputation_score=self.reputation_score,
             sats_per_gflop=self.sats_per_gflop,
+            min_task_sats=self.min_task_sats,
         )
 
 

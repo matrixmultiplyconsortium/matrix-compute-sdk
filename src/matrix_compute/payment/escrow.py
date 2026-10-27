@@ -57,7 +57,7 @@ class SettlementBackendProtocol(Protocol):
         self,
         task_id_or_request: Any,
         total_compute_sats: Optional[int] = None,
-        platform_fee_percent: float = 0.02,
+        platform_fee_percent: float = 0.05,
         worker_lightning_address: str = "worker@node",
         payment_hash: Optional[str] = None,
         expiry_seconds: int = 3600,
@@ -253,6 +253,8 @@ class EscrowManager:
     Guarantees strict state transitions, preimage secrecy, and timeout sweeps.
     """
 
+    _instances: List["EscrowManager"] = []
+
     def __init__(
         self,
         settlement_backend: Optional[SettlementBackendProtocol] = None,
@@ -260,6 +262,7 @@ class EscrowManager:
         default_timeout_seconds: float = 300.0,
         **kwargs: Any,
     ) -> None:
+        EscrowManager._instances.append(self)
         self.config = config
         self.verification_key = kwargs.get("verification_key")
         self.auto_settle = kwargs.get("auto_settle", False)
@@ -272,6 +275,16 @@ class EscrowManager:
             settlement_backend if settlement_backend is not None else MockSettlementService()
         )
         self.lnd_payer = kwargs.get("lnd_payer")
+        self.nwc_client = kwargs.get("nwc_client")
+        if self.nwc_client is None and self.config is not None and getattr(self.config, "nwc_uri", None):
+            try:
+                from matrix_compute.payment.nwc_client import NwcClient, NwcConnectionParams
+                self.nwc_client = NwcClient(
+                    params=NwcConnectionParams.from_uri(self.config.nwc_uri),
+                    timeout_seconds=self.default_timeout_seconds,
+                )
+            except Exception as ex:
+                logger.warning("Failed initializing NwcClient from config.nwc_uri: %s", ex)
 
         self._lock = threading.RLock()
         self._escrows: Dict[str, EscrowState] = {}          # task_id -> EscrowState
@@ -383,7 +396,7 @@ class EscrowManager:
 
             macaroon_str = getattr(inv_resp, "macaroon", "")
             payment_req = getattr(inv_resp, "payment_request", "")
-            fee_sats = getattr(inv_resp, "platform_fee_sats", int(round(total_sats * 0.02)))
+            fee_sats = getattr(inv_resp, "platform_fee_sats", int(round(total_sats * 0.05)))
             payout_sats = getattr(inv_resp, "worker_payout_sats", total_sats - fee_sats)
 
             # If settlement backend minted its own preimage and none was provided locally
@@ -513,7 +526,7 @@ class EscrowManager:
 
             macaroon_str = getattr(inv_resp, "macaroon", "")
             payment_req = getattr(inv_resp, "payment_request", "")
-            fee_sats = getattr(inv_resp, "platform_fee_sats", int(round(total_sats * 0.02)))
+            fee_sats = getattr(inv_resp, "platform_fee_sats", int(round(total_sats * 0.05)))
             payout_sats = getattr(inv_resp, "worker_payout_sats", total_sats - fee_sats)
 
             if preimage_hex is None and getattr(inv_resp, "preimage", None):
@@ -570,7 +583,19 @@ class EscrowManager:
                 )
 
             try:
-                if self.lnd_payer is not None and escrow.payment_request:
+                if self.nwc_client is not None and escrow.payment_request:
+                    pay_res = self.nwc_client.pay_invoice(
+                        escrow.payment_request,
+                        expected_payment_hash=escrow.payment_hash,
+                    )
+                    if isinstance(pay_res, dict) and pay_res.get("preimage"):
+                        escrow._preimage = pay_res["preimage"]
+                    if hasattr(self.settlement_backend, "hold_invoice"):
+                        try:
+                            self.settlement_backend.hold_invoice(escrow.payment_hash)
+                        except Exception:
+                            pass
+                elif self.lnd_payer is not None and escrow.payment_request:
                     self.lnd_payer.pay_invoice(escrow.payment_request)
                     # Over WAN / Mutinynet, wait briefly for settlement node to observe ACCEPTED/HELD
                     if hasattr(self.settlement_backend, "get_status"):
@@ -587,7 +612,7 @@ class EscrowManager:
                     self.settlement_backend.hold_invoice(escrow.payment_hash)
             except Exception as ex:
                 raise EscrowStateError(
-                    f"Settlement backend or LND payer failed to hold invoice: {ex}",
+                    f"Settlement backend or payment client failed to hold invoice: {ex}",
                     task_id=escrow.task_id,
                     current_status=escrow.status.value,
                     attempted_transition="HOLD",
@@ -937,3 +962,17 @@ class EscrowManager:
                 fraud_proof=fraud_proof,
             )
             return False, cancelled_escrow, fraud_proof
+
+    def close(self) -> None:
+        """Closes payment clients and releases resources."""
+        with self._lock:
+            if self.nwc_client is not None and hasattr(self.nwc_client, "close"):
+                try:
+                    self.nwc_client.close()
+                except Exception:
+                    pass
+            if self.lnd_payer is not None and hasattr(self.lnd_payer, "close"):
+                try:
+                    self.lnd_payer.close()
+                except Exception:
+                    pass

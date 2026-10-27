@@ -584,13 +584,13 @@ class TestTier1FeatureCoverage:
         assert mock_settlement.get_status(payment_hash) == "UNPAID"
 
     def test_t1_37_hodl_invoice_fee_calculation(self, mock_settlement):
-        """T1.F8.2: 2% platform routing fee is correctly deducted from total compute sats."""
+        """T1.F8.2: 5% platform routing fee is correctly deducted from total compute sats."""
         resp = mock_settlement.create_hodl_invoice(
             task_id="task_fee",
             total_compute_sats=1000,
         )
-        assert resp.platform_fee_sats == 20
-        assert resp.worker_payout_sats == 980
+        assert resp.platform_fee_sats == 50
+        assert resp.worker_payout_sats == 950
 
     def test_t1_38_l402_auth_header_format(self):
         """T1.F8.3: Formats Authorization header as 'L402 <macaroon>:<payment_hash>'."""

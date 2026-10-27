@@ -22,6 +22,8 @@ from .l402_client import (
 )
 
 from .lnd_payer import LndPayer
+from .nwc_params import NwcConnectionParams, parse_nwc_uri
+from .nwc_client import NwcClient, PaymentTimeoutError
 
 __all__ = [
     # Escrow State Machine
@@ -44,5 +46,10 @@ __all__ = [
     "MockSettlementBackend",
     "HttpSettlementBackend",
     "LndPayer",
+    # NWC
+    "NwcClient",
+    "NwcConnectionParams",
+    "PaymentTimeoutError",
+    "parse_nwc_uri",
 ]
 

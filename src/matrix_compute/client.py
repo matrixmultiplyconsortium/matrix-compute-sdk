@@ -49,14 +49,23 @@ class MatrixComputeClient:
     and automatic hermetic offline test double provisioning.
     """
 
-    def __init__(self, config: Optional[ClientConfig] = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        config: Optional[ClientConfig] = None,
+        nwc_connection_uri: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Initialize the MatrixComputeClient.
 
         Args:
             config: Optional ClientConfig instance. If omitted, loaded from environment and kwargs.
+            nwc_connection_uri: Optional Nostr Wallet Connect connection URI.
             **kwargs: Configuration overrides passed to ClientConfig.load().
         """
+        if nwc_connection_uri is not None:
+            kwargs["nwc_uri"] = nwc_connection_uri
+
         if config is not None:
             if kwargs:
                 cfg_dict = config.model_dump()
@@ -131,12 +140,25 @@ class MatrixComputeClient:
                 timeout_seconds=self.config.task_timeout_seconds,
             )
 
+        nwc_client = None
+        if getattr(self.config, "nwc_uri", None):
+            try:
+                from matrix_compute.payment.nwc_client import NwcClient, NwcConnectionParams
+                nwc_client = NwcClient(
+                    params=NwcConnectionParams.from_uri(self.config.nwc_uri),
+                    timeout_seconds=self.config.task_timeout_seconds,
+                )
+            except Exception as ex:
+                logger.warning("Failed initializing NwcClient in MatrixComputeClient: %s", ex)
+
         self.escrow_manager = EscrowManager(
             settlement_backend=backend,
             default_timeout_seconds=self.config.task_timeout_seconds,
             verification_key=self.config.settlement_verification_key,
             auto_settle=False,
             lnd_payer=lnd_payer,
+            nwc_client=nwc_client,
+            config=self.config,
         )
 
         # 4. P2P gRPC subsystem
@@ -364,6 +386,13 @@ class MatrixComputeClient:
                     self.relay_client.close()
                 except Exception as ex:
                     logger.debug("Error closing relay client: %s", ex)
+
+            # Close escrow manager and payment clients
+            if hasattr(self, "escrow_manager") and self.escrow_manager is not None:
+                try:
+                    self.escrow_manager.close()
+                except Exception as ex:
+                    logger.debug("Error closing escrow manager: %s", ex)
 
     def __enter__(self) -> "MatrixComputeClient":
         return self

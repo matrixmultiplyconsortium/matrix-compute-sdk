@@ -94,6 +94,10 @@ class ClientConfig(BaseModel):
     consumer_lnd_tls_path: Optional[str] = Field(
         None, description="File path to Consumer LND tls.cert"
     )
+    nwc_uri: Optional[str] = Field(
+        default=None,
+        description="Nostr Wallet Connect URI (nostr+walletconnect://<wallet_pubkey>?relay=<relay_url>&secret=<client_secret>)",
+    )
 
     # Network Timeouts & Retries
     connect_timeout_seconds: float = Field(5.0, ge=0.1, description="Worker gRPC connection timeout")
@@ -272,6 +276,7 @@ class ClientConfig(BaseModel):
             "consumer_lnd_macaroon_path": ["CONSUMER_LND_MACAROON_PATH", "MATRIX_CONSUMER_LND_MACAROON_PATH", "LND_MACAROON_PATH"],
             "consumer_lnd_tls_cert": ["CONSUMER_LND_TLS_CERT", "MATRIX_CONSUMER_LND_TLS_CERT", "LND_TLS_CERT"],
             "consumer_lnd_tls_path": ["CONSUMER_LND_TLS_PATH", "MATRIX_CONSUMER_LND_TLS_PATH", "LND_TLS_PATH"],
+            "nwc_uri": ["MATRIX_NWC_URI", "NWC_URI", "NOSTR_WALLET_CONNECT_URI"],
         }
 
         enriched = dict(data)
@@ -471,6 +476,21 @@ class ClientConfig(BaseModel):
                 raise ValueError(f"Invalid relay URL scheme in '{r}'; expected ws, wss, http, or https")
         return v
 
+    @field_validator("nwc_uri")
+    @classmethod
+    def validate_nwc_uri(cls, v: Optional[str]) -> Optional[str]:
+        """Validates NWC URI format and parameters upon configuration initialization."""
+        if v is None:
+            return None
+        cleaned = str(v).strip()
+        if not cleaned:
+            return None
+        from matrix_compute.payment.nwc_params import NwcConnectionParams
+
+        # Raises ValueError if URI is malformed, missing required params, or has bad hex/schemes
+        NwcConnectionParams.from_uri(cleaned)
+        return cleaned
+
     @model_validator(mode="after")
     def validate_and_sync_grid_shape(self) -> "ClientConfig":
         """Validates and synchronizes grid_rows, grid_cols, and grid_shape."""
@@ -523,6 +543,19 @@ class ClientConfig(BaseModel):
     def is_gemm_workload(self) -> bool:
         """Returns True if configured for one-shot GEMM workloads (GEMM_ONE_SHOT)."""
         return self.workload_type == WorkloadType.GEMM_ONE_SHOT
+
+    @property
+    def nwc_params(self) -> Optional[Any]:
+        """Returns parsed NwcConnectionParams if nwc_uri is configured, else None."""
+        if not self.nwc_uri:
+            return None
+        from matrix_compute.payment.nwc_params import NwcConnectionParams
+        return NwcConnectionParams.from_uri(self.nwc_uri)
+
+    @property
+    def is_nwc_enabled(self) -> bool:
+        """Returns True if a valid NWC URI is configured."""
+        return bool(self.nwc_uri and self.nwc_uri.strip())
 
     @classmethod
     def load(cls, **kwargs: Any) -> "ClientConfig":

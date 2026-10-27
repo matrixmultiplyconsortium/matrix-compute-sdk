@@ -300,8 +300,8 @@ def test_settlement_create_invoice_trustless():
     )
     assert resp.payment_hash == p_hash
     assert resp.preimage is None
-    assert resp.platform_fee_sats == 10  # 2% of 500
-    assert resp.worker_payout_sats == 490
+    assert resp.platform_fee_sats == 25  # 5% of 500
+    assert resp.worker_payout_sats == 475
     assert resp["payment_hash"] == p_hash
     assert settlement.get_status(p_hash) == "UNPAID"
 

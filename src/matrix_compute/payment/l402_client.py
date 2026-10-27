@@ -138,6 +138,9 @@ class MacaroonCaveats:
     worker_pubkey: Optional[str] = None
     task_ids: Optional[List[str]] = None
     job_id: Optional[str] = None
+    tier: str = "PAID_MAINNET"
+    allowed_workers: Optional[List[str]] = None
+    max_matrix_dim: Optional[int] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -155,6 +158,12 @@ class MacaroonCaveats:
             d["task_ids"] = list(self.task_ids)
         if self.job_id is not None:
             d["job_id"] = self.job_id
+        if self.tier and self.tier != "PAID_MAINNET":
+            d["tier"] = self.tier
+        if self.allowed_workers is not None:
+            d["allowed_workers"] = list(self.allowed_workers)
+        if self.max_matrix_dim is not None:
+            d["max_matrix_dim"] = int(self.max_matrix_dim)
         d.update(self.extra)
         return d
 
@@ -186,6 +195,10 @@ class MacaroonToken:
             raise MacaroonError("Macaroon token string cannot be empty")
 
         clean = raw_b64.strip()
+        if clean.startswith("mc_trial_"):
+            clean = clean[len("mc_trial_") :].strip()
+        if not clean:
+            raise MacaroonError("Macaroon token string cannot be empty")
         # Add padding if needed
         missing_padding = len(clean) % 4
         if missing_padding:
@@ -200,24 +213,31 @@ class MacaroonToken:
         if not isinstance(payload, dict):
             raise MacaroonError("Macaroon payload must be a JSON object")
 
-        if "caveats" not in payload or "signature" not in payload:
-            raise MacaroonError("Macaroon payload missing 'caveats' or 'signature'")
-
-        raw_caveats = payload["caveats"]
-        sig = str(payload["signature"])
+        if "caveats" not in payload and "sig" in payload and isinstance(payload.get("sig"), str):
+            raw_caveats = {k: v for k, v in payload.items() if k != "sig"}
+            sig = str(payload["sig"])
+        else:
+            if "caveats" not in payload or "signature" not in payload:
+                raise MacaroonError("Macaroon payload missing 'caveats' or 'signature'")
+            raw_caveats = payload["caveats"]
+            sig = str(payload["signature"])
 
         if not isinstance(raw_caveats, dict):
             raise MacaroonError("Macaroon 'caveats' must be a JSON dictionary")
 
         task_id = str(raw_caveats.get("task_id", ""))
-        p_hash = str(raw_caveats.get("payment_hash", ""))
-        expiry = int(raw_caveats.get("expiry", 0))
-        max_gflops = float(raw_caveats.get("max_gflops", 0.0))
+        p_hash = str(raw_caveats.get("payment_hash", "0" * 64))
+        expiry = int(raw_caveats.get("expiry") if "expiry" in raw_caveats else raw_caveats.get("expires_at", 0))
+        max_gflops = float(raw_caveats.get("max_gflops", 138.0))
         locked_sats = int(raw_caveats.get("locked_sats", 0))
         worker_pk = raw_caveats.get("worker_pubkey")
         task_ids_val = raw_caveats.get("task_ids")
         task_ids = list(task_ids_val) if isinstance(task_ids_val, (list, tuple)) else None
         job_id = str(raw_caveats["job_id"]) if "job_id" in raw_caveats and raw_caveats["job_id"] is not None else None
+        tier = str(raw_caveats.get("tier", "PAID_MAINNET"))
+        allowed_workers_val = raw_caveats.get("allowed_workers")
+        allowed_workers = list(allowed_workers_val) if isinstance(allowed_workers_val, (list, tuple)) else None
+        max_matrix_dim = int(raw_caveats["max_matrix_dim"]) if "max_matrix_dim" in raw_caveats and raw_caveats["max_matrix_dim"] is not None else None
 
         extra = {
             k: v
@@ -231,6 +251,9 @@ class MacaroonToken:
                 "worker_pubkey",
                 "task_ids",
                 "job_id",
+                "tier",
+                "allowed_workers",
+                "max_matrix_dim",
             )
         }
 
@@ -243,6 +266,9 @@ class MacaroonToken:
             worker_pubkey=worker_pk,
             task_ids=task_ids,
             job_id=job_id,
+            tier=tier,
+            allowed_workers=allowed_workers,
+            max_matrix_dim=max_matrix_dim,
             extra=extra,
         )
 

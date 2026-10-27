@@ -17,6 +17,21 @@ from .tdx_verifier import (
     IntelTdxVerifier,
     parse_pck_extensions,
 )
+from .nip04 import (
+    Nip04Cipher,
+    compute_nip04_shared_secret,
+    nip04_decrypt,
+    nip04_decrypt_raw,
+    nip04_encrypt,
+)
+from .hashcash import (
+    HashcashSolver,
+    HashcashVerifier,
+    count_leading_zero_bits,
+    solve_hashcash,
+    verify_hashcash,
+    verify_hashcash_with_reason,
+)
 from .keys import (
     SECP256K1_HALF_ORDER,
     SECP256K1_ORDER,
@@ -398,4 +413,17 @@ __all__ = [
     "X25519_KEY_BYTES",
     "NONCE_BYTES",
     "HKDF_INFO_LABEL",
+    # NIP-04 ECDH AES-256-CBC Cipher
+    "compute_nip04_shared_secret",
+    "nip04_encrypt",
+    "nip04_decrypt",
+    "nip04_decrypt_raw",
+    "Nip04Cipher",
+    # Hashcash Proof-of-Work
+    "HashcashSolver",
+    "HashcashVerifier",
+    "count_leading_zero_bits",
+    "solve_hashcash",
+    "verify_hashcash",
+    "verify_hashcash_with_reason",
 ]

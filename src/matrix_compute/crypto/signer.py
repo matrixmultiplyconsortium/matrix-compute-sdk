@@ -290,3 +290,18 @@ class ClientSigner:
     ) -> bool:
         """Classmethod matching WorkerSigner.verify_peer_signature."""
         return verify_signature(pubkey_hex, data, signature_hex)
+
+    def nip04_encrypt(self, recipient_pubkey: Union[str, bytes], plaintext: Union[str, bytes]) -> str:
+        """Encrypts message for recipient public key using NIP-04 ECDH AES-256-CBC."""
+        from .nip04 import nip04_encrypt
+        return nip04_encrypt(self._privkey_hex, recipient_pubkey, plaintext)
+
+    def nip04_decrypt(self, sender_pubkey: Union[str, bytes], payload: str) -> str:
+        """Decrypts NIP-04 payload from sender public key."""
+        from .nip04 import nip04_decrypt
+        return nip04_decrypt(self._privkey_hex, sender_pubkey, payload)
+
+    def compute_nip04_shared_secret(self, peer_pubkey: Union[str, bytes]) -> bytes:
+        """Computes 32-byte Secp256k1 ECDH unhashed shared secret with peer."""
+        from .nip04 import compute_nip04_shared_secret
+        return compute_nip04_shared_secret(self._privkey_hex, peer_pubkey)

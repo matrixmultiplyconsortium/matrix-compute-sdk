@@ -424,7 +424,8 @@ class DistributedMatmulCoordinator:
         for g_idx, (assigned_worker, tasks) in enumerate(active_groups):
             assigned_pubkey = getattr(assigned_worker, "worker_pubkey", getattr(assigned_worker, "pubkey", ""))
             sats_per_gflop = getattr(assigned_worker, "sats_per_gflop", self.config.max_price_per_gflop)
-            total_sats = sum(max(int(math.ceil(t.estimated_gflops * sats_per_gflop)), 10) for t in tasks)
+            min_task_sats = int(getattr(assigned_worker, "min_task_sats", 10))
+            total_sats = sum(max(int(math.ceil(t.estimated_gflops * sats_per_gflop)), min_task_sats) for t in tasks)
             total_gflops = sum(t.estimated_gflops for t in tasks)
             total_sats_spent += total_sats
 
@@ -820,6 +821,7 @@ class DistributedMatmulCoordinator:
                 pubkey = getattr(w, "pubkey", "")
                 ln_key = getattr(w, "lightning_routing_pubkey", "worker@node")
                 sats_rate = getattr(w, "sats_per_gflop", 0.0005)
+                min_sats = int(getattr(w, "min_task_sats", 10))
                 matched.append(
                     MatchedWorker(
                         worker_pubkey=pubkey,
@@ -827,6 +829,7 @@ class DistributedMatmulCoordinator:
                         lightning_routing_pubkey=ln_key,
                         reputation_score=1.0,
                         sats_per_gflop=sats_rate,
+                        min_task_sats=min_sats,
                     )
                 )
             return matched

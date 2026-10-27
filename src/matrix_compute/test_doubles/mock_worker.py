@@ -822,7 +822,13 @@ class MockWorkerNode:
     def start(self) -> MockWorkerNode:
         if self.server is not None:
             return self
-        self.server = grpc.server(self._thread_pool)
+        self.server = grpc.server(
+            self._thread_pool,
+            options=[
+                ("grpc.max_receive_message_length", 512 * 1024 * 1024),
+                ("grpc.max_send_message_length", 512 * 1024 * 1024),
+            ],
+        )
         pb2_grpc.add_MatrixComputeServiceServicer_to_server(self.servicer, self.server)
         self.port = self.server.add_insecure_port(f"127.0.0.1:{self._requested_port}")
         self.server.start()

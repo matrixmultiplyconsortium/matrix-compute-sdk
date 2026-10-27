@@ -98,6 +98,10 @@ from .payment import (
     format_grpc_metadata,
     generate_escrow_secret,
     validate_preimage,
+    NwcClient,
+    NwcConnectionParams,
+    PaymentTimeoutError,
+    parse_nwc_uri,
 )
 from .test_doubles import (
     MockNostrRelay,
@@ -212,6 +216,10 @@ __all__ = [
     "format_grpc_metadata",
     "generate_escrow_secret",
     "validate_preimage",
+    "NwcClient",
+    "NwcConnectionParams",
+    "PaymentTimeoutError",
+    "parse_nwc_uri",
     # Tiling Subsystem
     "MatrixTiler",
     "TileTaskPlan",

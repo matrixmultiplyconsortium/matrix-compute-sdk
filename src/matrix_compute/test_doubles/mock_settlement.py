@@ -184,7 +184,7 @@ class MockSettlementService:
         self,
         task_id_or_request: Union[str, CreateHodlInvoiceRequest] = "",
         total_compute_sats: Optional[int] = None,
-        platform_fee_percent: float = 0.02,
+        platform_fee_percent: float = 0.05,
         worker_lightning_address: str = "worker@testnode.local",
         payment_hash: Optional[str] = None,
         expiry_seconds: int = 3600,
