@@ -10,14 +10,29 @@ and result assembly.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from matrix_compute.config import ClientConfig, PartitioningStrategy, get_default_config
+from matrix_compute.crypto.attestation_verifier import AttestationVerifier, VerificationPolicy
+from matrix_compute.crypto.hashcash import solve_hashcash
+from matrix_compute.crypto.pki_fixtures import (
+    DEFAULT_GOLDEN_RIM,
+    DEFAULT_SNP_GOLDEN_RIM,
+    DEFAULT_TDX_GOLDEN_RIM,
+    get_default_amd_pki,
+    get_default_intel_pki,
+    get_default_pki,
+)
 from matrix_compute.crypto.signer import ClientSigner
 from matrix_compute.discovery.matchmaker import Matchmaker
 from matrix_compute.discovery.relay_client import RelayClient
@@ -86,6 +101,13 @@ class MatrixComputeClient:
         self._mock_relay: Optional[MockNostrRelay] = None
         self._mock_settlement: Optional[MockSettlementService] = None
         self._mock_workers: List[MockWorkerNode] = []
+
+        # Trial & execution telemetry
+        self.last_trial_macaroon: Optional[str] = None
+        self.last_hashcash_stamp: Optional[str] = None
+        self.last_hashcash_solve_ms: float = 0.0
+        self.last_manifest: Optional[Any] = None
+        self.last_assembler: Optional[Any] = None
 
         # Internal subsystems
         self._init_subsystems()
@@ -166,12 +188,27 @@ class MatrixComputeClient:
             max_message_bytes=self.config.grpc_max_message_bytes,
             ssl_enabled=self.config.ssl_enabled,
         )
+        attestation_verifier = None
+        if self.config.offline_mock_mode and self.config.require_confidential_compute:
+            policy = VerificationPolicy()
+            policy.add_trusted_root_pem(get_default_pki().root_cert_pem)
+            policy.add_trusted_root_pem(get_default_amd_pki().root_cert_pem)
+            policy.add_trusted_root_pem(get_default_intel_pki().root_cert_pem)
+            policy.add_golden_rim("nvidia-cca", DEFAULT_GOLDEN_RIM)
+            policy.add_golden_rim("simulated-cca", DEFAULT_GOLDEN_RIM)
+            policy.add_golden_rim("amd-sev-snp", DEFAULT_SNP_GOLDEN_RIM)
+            policy.add_golden_rim("intel-tdx", DEFAULT_TDX_GOLDEN_RIM)
+            attestation_verifier = AttestationVerifier(policy=policy)
+
         self.dispatcher = GrpcTaskDispatcher(
             channel_pool=self.channel_pool,
             consumer_pubkey=self.signer.get_pubkey_hex(),
             connect_timeout=self.config.connect_timeout_seconds,
             task_timeout=self.config.task_timeout_seconds,
             chunk_size_bytes=self.config.chunk_size_bytes,
+            require_confidential_compute=self.config.require_confidential_compute,
+            required_tee_type=self.config.required_tee_type,
+            attestation_verifier=attestation_verifier,
         )
 
         # 5. Orchestrator & Scheduler
@@ -298,12 +335,49 @@ class MatrixComputeClient:
                 expected_inner_dim=k,
             )
 
+        # 1b. Zero-Drain Trial Sandbox guardrails (mode="trial")
+        if self.config.is_trial_mode:
+            if m > 4096 or k > 4096 or n > 4096:
+                raise MatrixDimensionError(
+                    f"PERMISSION_DENIED: Trial macaroon dimension exceeds 4096 cap (got A={A.shape}, B={B.shape}). "
+                    "Pass nwc_uri='nostr+walletconnect://...' in mode='mainnet' for unbounded dimensions.",
+                    shape_a=A.shape,
+                    shape_b=B.shape,
+                )
+            pow_t0 = time.perf_counter()
+            self.last_hashcash_stamp = solve_hashcash(
+                resource=self.signer.get_pubkey_hex()[:16],
+                bits=self.config.trial_hashcash_bits,
+            )
+            self.last_hashcash_solve_ms = (time.perf_counter() - pow_t0) * 1000.0
+            trial_caveats = {
+                "mode": "trial",
+                "target_workers": [w.pubkey for w in self._mock_workers] or ["seed-worker-01", "seed-worker-02"],
+                "max_matrix_dim": 4096,
+                "max_gflops": (2.0 * 4096.0 * 4096.0 * 4096.0) / 1e9,
+                "locked_sats": 0,
+                "expiry": int(time.time()) + 300,
+                "hashcash": self.last_hashcash_stamp,
+            }
+            caveat_json = json.dumps(trial_caveats, sort_keys=True)
+            sig = hmac.new(
+                self.config.settlement_verification_key.encode("utf-8"),
+                caveat_json.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            token_b64 = base64.urlsafe_b64encode(
+                json.dumps({"caveats": trial_caveats, "signature": sig}).encode("utf-8")
+            ).decode("ascii")
+            self.last_trial_macaroon = f"mc_trial_{token_b64}"
+
         # 2. Resolve target dtype
         target_dtype = normalize_dtype(dtype or self.config.dtype_preference)
         eff_tile_size = int(tile_size) if tile_size is not None else self.config.default_tile_size
+        if self.config.is_trial_mode and tile_size is None and max(m, k, n) >= 1024:
+            eff_tile_size = max(eff_tile_size, 2048)
 
         # 3. Delegate to distributed coordinator
-        return self.coordinator.execute_gemm(
+        result = self.coordinator.execute_gemm(
             A=A,
             B=B,
             dtype=target_dtype,
@@ -315,6 +389,11 @@ class MatrixComputeClient:
             grid_shape=grid_shape,
             **kwargs,
         )
+        self.last_manifest = getattr(self.coordinator, "last_manifest", getattr(self.coordinator, "_last_manifest", None))
+        self.last_assembler = getattr(self.coordinator, "last_assembler", getattr(self.coordinator, "_last_assembler", None))
+        if self.config.is_trial_mode and self.last_manifest is not None:
+            self.last_manifest.total_cost_sats = 0
+        return result
 
     def power_iteration(
         self,

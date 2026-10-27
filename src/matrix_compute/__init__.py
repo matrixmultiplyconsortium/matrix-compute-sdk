@@ -23,6 +23,10 @@ from .crypto import (
     verify_signature,
     verify_tile_result_signature,
 )
+from .crypto.attestation_verifier import (
+    AttestationVerifier,
+    VerificationPolicy,
+)
 from .discovery import (
     DiscoveredWorker,
     Matchmaker,
@@ -31,6 +35,10 @@ from .discovery import (
     RelayStatus,
 )
 from .exceptions import (
+    AttestationBindingError,
+    AttestationError,
+    AttestationMeasurementMismatchError,
+    AttestationNonceMismatchError,
     BudgetExceededError,
     ConfigurationError,
     DiscoveryError,
@@ -109,6 +117,8 @@ from .test_doubles import (
     MockWorkerNode,
 )
 from .tiling import (
+    BandwidthProfile,
+    BandwidthProfiler,
     MatrixTiler,
     ResultAssembler,
     TileGridPlan,
@@ -221,6 +231,8 @@ __all__ = [
     "PaymentTimeoutError",
     "parse_nwc_uri",
     # Tiling Subsystem
+    "BandwidthProfile",
+    "BandwidthProfiler",
     "MatrixTiler",
     "TileTaskPlan",
     "TileGridPlan",

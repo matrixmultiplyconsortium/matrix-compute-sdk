@@ -40,6 +40,17 @@ except ImportError:
         WorkerAnnouncePayload,
     )
 
+from matrix_compute.crypto.pki_fixtures import (
+    create_valid_attestation_evidence,
+    create_valid_intel_tdx_evidence,
+    create_valid_sev_snp_evidence,
+)
+from matrix_compute.crypto.session import (
+    decrypt_chunk,
+    derive_session_keys,
+    encrypt_result,
+    generate_ephemeral_keypair,
+)
 from matrix_compute.test_doubles.mock_relay import MockNostrRelay
 from matrix_compute.test_doubles.mock_settlement import MockSettlementService
 
@@ -157,6 +168,11 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         self.release_calls: int = 0
         self.uploaded_bytes_total: int = 0
 
+        # Confidential computing telemetry
+        self.last_wire_ciphertext_chunks: List[bytes] = []
+        self.last_encrypted_result_bytes: Optional[bytes] = None
+        self.last_attestation_evidence: Optional[bytes] = None
+
     @property
     def tamper_step_iteration(self) -> Optional[int]:
         return self.tamper_step_index
@@ -216,6 +232,48 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
         n = int(request.matrix_b_cols)
         estimated_gflops = (2.0 * float(m) * float(k) * float(n)) / 1e9
 
+        is_confidential = bool(getattr(request, "require_confidential_compute", False))
+        worker_pub = b""
+        attestation_evidence = b""
+        tee_type = ""
+        session_keys = None
+
+        if is_confidential:
+            worker_priv, worker_pub = generate_ephemeral_keypair()
+            req_tee = (getattr(request, "required_tee_type", "") or "nvidia-cca").lower().strip()
+            tee_type = req_tee
+            nonce = getattr(request, "attestation_nonce", b"") or b""
+            client_pub = getattr(request, "client_ephemeral_pubkey", b"") or b""
+
+            if req_tee == "amd-sev-snp":
+                ev_obj = create_valid_sev_snp_evidence(
+                    nonce=nonce,
+                    worker_ephemeral_pubkey=worker_pub,
+                )
+            elif req_tee == "intel-tdx":
+                ev_obj = create_valid_intel_tdx_evidence(
+                    nonce=nonce,
+                    worker_ephemeral_pubkey=worker_pub,
+                )
+            else:
+                ev_obj = create_valid_attestation_evidence(
+                    nonce=nonce,
+                    worker_ephemeral_pubkey=worker_pub,
+                    provider=req_tee,
+                )
+            attestation_evidence = (
+                ev_obj.model_dump_json().encode("utf-8")
+                if hasattr(ev_obj, "model_dump_json")
+                else bytes(ev_obj)
+            )
+
+            if len(client_pub) == 32:
+                session_keys = derive_session_keys(
+                    secret_or_priv=worker_priv,
+                    nonce_c_or_pub=client_pub,
+                    nonce_w_or_salt=nonce,
+                )
+
         with self._lock:
             self._task_metadata[request.task_id] = {
                 "m": m,
@@ -224,8 +282,13 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
                 "dtype": dtype,
                 "gflops": estimated_gflops,
                 "created_at": time.time(),
+                "is_confidential": is_confidential,
+                "session_keys": session_keys,
+                "tee_type": tee_type,
             }
             self.last_task_id = request.task_id
+            if is_confidential:
+                self.last_attestation_evidence = attestation_evidence
 
         return pb2.TileTaskAck(
             task_id=request.task_id,
@@ -233,6 +296,9 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
             estimated_gflops=estimated_gflops,
             worker_pubkey=self.signer.get_pubkey_hex(),
             message="Node ready",
+            worker_ephemeral_pubkey=worker_pub,
+            attestation_evidence=attestation_evidence,
+            tee_type=tee_type,
         )
 
     def _verify_l402_gate(
@@ -420,7 +486,28 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
                         context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
                     raise ValueError(msg)
 
-                chunk_data = chunk.chunk_bytes or b""
+                raw_wire_chunk = chunk.chunk_bytes or b""
+                if getattr(chunk, "is_encrypted", False):
+                    with self._lock:
+                        self.last_wire_ciphertext_chunks.append(raw_wire_chunk)
+                    session_keys = task_info.get("session_keys")
+                    if session_keys is None or session_keys.k_c2w is None:
+                        msg = f"Encrypted chunk received for task '{task_id}' without negotiated session keys"
+                        if context:
+                            context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+                        raise RuntimeError(msg)
+                    chunk_data = decrypt_chunk(
+                        key=session_keys.k_c2w,
+                        ciphertext=raw_wire_chunk,
+                        iv=chunk.iv,
+                        tag=chunk.tag,
+                        task_id=task_id,
+                        sequence_number=chunk.sequence_number,
+                        is_matrix_a=chunk.is_matrix_a,
+                        is_final_chunk=chunk.is_final_chunk,
+                    )
+                else:
+                    chunk_data = raw_wire_chunk
                 chunk_len = len(chunk_data)
 
                 if chunk.is_matrix_a:
@@ -507,8 +594,32 @@ class MockWorkerServicer(pb2_grpc.MatrixComputeServiceServicer):
                     "end_time": end_time,
                 })
 
+            eff_task_id = self.override_result_task_id or task_id
+            if task_info.get("is_confidential") and task_info.get("session_keys") is not None:
+                session_keys = task_info["session_keys"]
+                ct, iv, tag = encrypt_result(
+                    key=session_keys.k_w2c,
+                    plaintext=c_bytes,
+                    task_id=eff_task_id,
+                    rows=m,
+                    cols=n,
+                )
+                with self._lock:
+                    self.last_encrypted_result_bytes = ct
+                return pb2.TileResult(
+                    task_id=eff_task_id,
+                    rows=m,
+                    cols=n,
+                    result_bytes=ct,
+                    worker_signature=sig,
+                    execution_time_ms=max(exec_time_ms, 1),
+                    is_encrypted=True,
+                    iv=iv,
+                    tag=tag,
+                )
+
             return pb2.TileResult(
-                task_id=self.override_result_task_id or task_id,
+                task_id=eff_task_id,
                 rows=m,
                 cols=n,
                 result_bytes=c_bytes,

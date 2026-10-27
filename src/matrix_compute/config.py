@@ -173,7 +173,17 @@ class ClientConfig(BaseModel):
     grpc_max_message_bytes: int = Field(100 * 1024 * 1024, ge=1024 * 1024, description="Max gRPC message size")
     ssl_enabled: bool = Field(False, description="Whether worker gRPC channel uses TLS")
 
-    # Offline / Hermetic Test Doubles Controls
+    # Offline / Hermetic Test Doubles & Trial Sandbox Controls
+    mode: str = Field(
+        "mainnet",
+        description="Execution mode: 'mainnet', 'trial' (zero-drain trial sandbox), or 'mock'",
+    )
+    trial_hashcash_bits: int = Field(
+        16,
+        ge=0,
+        le=32,
+        description="Client-side SHA-256 Hashcash PoW difficulty bits when running in mode='trial'",
+    )
     offline_mock_mode: bool = Field(
         False, description="Master switch enabling in-memory test doubles without network daemons"
     )
@@ -277,6 +287,8 @@ class ClientConfig(BaseModel):
             "consumer_lnd_tls_cert": ["CONSUMER_LND_TLS_CERT", "MATRIX_CONSUMER_LND_TLS_CERT", "LND_TLS_CERT"],
             "consumer_lnd_tls_path": ["CONSUMER_LND_TLS_PATH", "MATRIX_CONSUMER_LND_TLS_PATH", "LND_TLS_PATH"],
             "nwc_uri": ["MATRIX_NWC_URI", "NWC_URI", "NOSTR_WALLET_CONNECT_URI"],
+            "mode": ["MATRIX_MODE", "MATRIX_COMPUTE_MODE"],
+            "trial_hashcash_bits": ["MATRIX_TRIAL_HASHCASH_BITS", "TRIAL_HASHCASH_BITS"],
         }
 
         enriched = dict(data)
@@ -302,6 +314,21 @@ class ClientConfig(BaseModel):
         for bf in bool_fields:
             if bf in enriched and isinstance(enriched[bf], str):
                 enriched[bf] = enriched[bf].strip().lower() in ("true", "1", "yes", "on")
+
+        # Automatically cascade trial / mock mode to offline_mock_mode when no live endpoints are forced
+        raw_mode = str(enriched.get("mode", "mainnet") or "mainnet").strip().lower()
+        if raw_mode in ("trial", "free_trial", "sandbox"):
+            enriched["mode"] = "trial"
+            if "offline_mock_mode" not in enriched or enriched["offline_mock_mode"] is None:
+                enriched["offline_mock_mode"] = True
+            if "require_confidential_compute" not in data:
+                enriched.setdefault("require_confidential_compute", False)
+        elif raw_mode in ("mock", "test", "testing"):
+            enriched["mode"] = "mock"
+            if "offline_mock_mode" not in enriched or enriched["offline_mock_mode"] is None:
+                enriched["offline_mock_mode"] = True
+        else:
+            enriched["mode"] = raw_mode
 
         # Automatically cascade master offline_mock_mode to child mock flags
         if enriched.get("offline_mock_mode") is True:
@@ -556,6 +583,11 @@ class ClientConfig(BaseModel):
     def is_nwc_enabled(self) -> bool:
         """Returns True if a valid NWC URI is configured."""
         return bool(self.nwc_uri and self.nwc_uri.strip())
+
+    @property
+    def is_trial_mode(self) -> bool:
+        """Returns True if configured for zero-drain trial sandbox execution (mode='trial')."""
+        return str(self.mode).strip().lower() == "trial"
 
     @classmethod
     def load(cls, **kwargs: Any) -> "ClientConfig":

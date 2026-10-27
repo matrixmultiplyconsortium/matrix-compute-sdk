@@ -54,6 +54,26 @@ class BandwidthProfile:
     def num_strips(self) -> int:
         return self.num_tasks
 
+    @property
+    def tasks_count(self) -> int:
+        return self.num_tasks
+
+    @property
+    def bytes_uploaded(self) -> int:
+        return self.total_uploaded_bytes
+
+    @property
+    def bytes_downloaded(self) -> int:
+        return self.download_elements * self.bytes_per_element
+
+    @property
+    def total_bytes_transferred(self) -> int:
+        return self.bytes_uploaded + self.bytes_downloaded
+
+    @property
+    def upload_redundancy_ratio(self) -> float:
+        return self.redundancy_ratio
+
     def __getitem__(self, key: str) -> Any:
         try:
             return getattr(self, key)
@@ -491,3 +511,95 @@ class BandwidthProfiler:
         return True
 
     verify_spatial_grid_coverage = verify_2d_grid_coverage
+
+    @classmethod
+    def compare_strategies(
+        cls,
+        m: int,
+        k: int,
+        n: int,
+        tile_size: int = 1024,
+        num_strips: int = 4,
+        grid_rows: int = 2,
+        grid_cols: int = 2,
+        dtype: str = "fp32",
+    ) -> Dict[str, BandwidthProfile]:
+        """
+        Compares theoretical bandwidth profiles across BLOCK_3D, OUTER_PRODUCT_1D,
+        and OUTPUT_GRID_2D without allocating full matrices when dimensions are large.
+        """
+        norm_dtype = normalize_dtype(dtype)
+        bpe = get_bytes_per_element(norm_dtype)
+        opt_up = m * k + k * n
+        opt_down = m * n
+
+        # 1. BLOCK_3D
+        i_blk = max(1, math.ceil(m / tile_size))
+        j_blk = max(1, math.ceil(n / tile_size))
+        l_blk = max(1, math.ceil(k / tile_size))
+        total_a_3d = j_blk * (m * k)
+        total_b_3d = i_blk * (k * n)
+        up_3d = total_a_3d + total_b_3d
+        down_3d = l_blk * (m * n)
+        prof_3d = BandwidthProfile(
+            m=m,
+            k=k,
+            n=n,
+            num_tasks=i_blk * j_blk * l_blk,
+            strategy="block_3d",
+            dtype=norm_dtype,
+            total_a_elements=total_a_3d,
+            total_b_elements=total_b_3d,
+            total_uploaded_elements=up_3d,
+            optimal_elements=opt_up,
+            redundancy_elements=up_3d - opt_up,
+            redundancy_ratio=(float(up_3d) / float(opt_up)) - 1.0 if opt_up > 0 else 0.0,
+            bytes_per_element=bpe,
+            total_uploaded_bytes=up_3d * bpe,
+            optimal_bytes=opt_up * bpe,
+            redundancy_bytes=(up_3d - opt_up) * bpe,
+            is_upload_optimal=(up_3d == opt_up),
+            download_elements=down_3d,
+            optimal_download_elements=opt_down,
+            download_redundancy_ratio=(float(down_3d) / float(opt_down)) - 1.0 if opt_down > 0 else 0.0,
+            is_download_optimal=(down_3d == opt_down),
+        )
+
+        # 2. OUTER_PRODUCT_1D
+        s = max(1, min(int(num_strips), k))
+        up_1d = opt_up
+        down_1d = s * (m * n)
+        prof_1d = BandwidthProfile(
+            m=m,
+            k=k,
+            n=n,
+            num_tasks=s,
+            strategy="outer_product_1d",
+            dtype=norm_dtype,
+            total_a_elements=m * k,
+            total_b_elements=k * n,
+            total_uploaded_elements=up_1d,
+            optimal_elements=opt_up,
+            redundancy_elements=0,
+            redundancy_ratio=0.0,
+            bytes_per_element=bpe,
+            total_uploaded_bytes=up_1d * bpe,
+            optimal_bytes=opt_up * bpe,
+            redundancy_bytes=0,
+            is_upload_optimal=True,
+            download_elements=down_1d,
+            optimal_download_elements=opt_down,
+            download_redundancy_ratio=(float(down_1d) / float(opt_down)) - 1.0 if opt_down > 0 else 0.0,
+            is_download_optimal=(s == 1),
+        )
+
+        # 3. OUTPUT_GRID_2D
+        prof_2d = cls.theoretical_2d_output_grid_bandwidth(
+            m=m, n=n, k=k, p_r=grid_rows, p_c=grid_cols, dtype=norm_dtype
+        )
+
+        return {
+            "block_3d": prof_3d,
+            "outer_product_1d": prof_1d,
+            "output_grid_2d": prof_2d,
+        }

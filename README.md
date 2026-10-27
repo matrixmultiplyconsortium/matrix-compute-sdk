@@ -1,5 +1,9 @@
 # matrix-compute-sdk
 
+[![Open In Colab — 01 Quickstart](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matrix-compute/matrix-compute-colab/blob/main/01_quickstart_distributed_matmul.ipynb)
+[![Open In Colab — 02 Partitioning](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matrix-compute/matrix-compute-colab/blob/main/02_partitioning_strategies_benchmark.ipynb)
+[![Open In Colab — 03 Confidential TEE](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matrix-compute/matrix-compute-colab/blob/main/03_confidential_computing_tee_demo.ipynb)
+
 Production-grade consumer Python library and orchestrator for distributed matrix multiplication over decentralized compute nodes.
 
 ## Features
