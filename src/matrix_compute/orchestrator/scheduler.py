@@ -303,7 +303,8 @@ class ParallelTaskScheduler:
                 elif escrow_manager is not None:
                     retry_task_id = f"{task_plan.task_id}_retry_{attempts}"
                     sats_per_gflop = getattr(worker, "sats_per_gflop", 0.0005)
-                    sats = max(int(math.ceil(task_plan.estimated_gflops * sats_per_gflop)), 10)
+                    min_task_sats = int(getattr(worker, "min_task_sats", 10))
+                    sats = max(int(math.ceil(task_plan.estimated_gflops * sats_per_gflop)), min_task_sats)
                     worker_ln = getattr(
                         worker,
                         "lightning_routing_pubkey",

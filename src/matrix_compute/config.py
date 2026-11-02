@@ -62,7 +62,7 @@ class ClientConfig(BaseModel):
 
     # Relay & Discovery Settings
     nostr_relays: List[str] = Field(
-        default_factory=lambda: ["ws://127.0.0.1:8008"],
+        default_factory=lambda: ["wss://relay.matrix-compute.net"],
         description="Nostr discovery relay WebSocket URLs for worker announcements",
     )
     min_worker_vram_mb: int = Field(4096, ge=512, description="Minimum worker VRAM in MB")
@@ -71,7 +71,7 @@ class ClientConfig(BaseModel):
 
     # Settlement & L402 Settings
     settlement_api_url: str = Field(
-        "http://127.0.0.1:8080", description="Settlement layer base HTTP URL"
+        "https://settlement.matrix-compute.net", description="Settlement layer base HTTP URL"
     )
     settlement_verification_key: str = Field(
         "settlement_secret_key_dev", description="L402 Macaroon HMAC verification key"

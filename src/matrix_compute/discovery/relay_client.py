@@ -76,6 +76,18 @@ class DiscoveredWorker:
     relay_url: str = ""
     raw_event: Optional[Dict[str, Any]] = None
     reputation_score: float = 1.0
+    nat_mode: str = "direct"
+    tee_capable: bool = False
+
+    @property
+    def endpoint(self) -> str:
+        """Alias for grpc_endpoint."""
+        return self.grpc_endpoint
+
+    @property
+    def supported_dtypes(self) -> List[str]:
+        """Alias for supported_precisions."""
+        return self.supported_precisions
 
     @property
     def worker_pubkey(self) -> str:
@@ -166,8 +178,8 @@ class RelayClient:
                 targets.append(relays)
 
         if not targets:
-            # Default to local mock/relay endpoint
-            targets = ["ws://127.0.0.1:8008"]
+            # Default to public discovery relay endpoint
+            targets = ["wss://relay.matrix-compute.net"]
 
         for target in targets:
             self._add_relay_target(target)
@@ -377,6 +389,8 @@ class RelayClient:
                     pass
 
         bond_txid = tag_dict.get("bond_txid") or None
+        nat_mode = tag_dict.get("nat_mode") or ("reverse_tunnel" if "p2p-circuit" in grpc_endpoint else "direct")
+        tee_capable = str(tag_dict.get("tee", "")).strip().lower() in ("true", "1", "yes") or bool(tag_dict.get("tee_type"))
 
         # Content fallback if any critical spec is missing
         needs_fallback = (
@@ -484,6 +498,8 @@ class RelayClient:
             relay_url=relay_url,
             raw_event=event,
             reputation_score=1.0,
+            nat_mode=nat_mode,
+            tee_capable=tee_capable,
         )
 
     def verify_event_signature(self, event: Dict[str, Any]) -> bool:
@@ -785,13 +801,22 @@ class RelayClient:
         """Connects to a live Nostr WebSocket relay, subscribes to Kind 30000, and returns events until EOSE."""
         import asyncio
         import concurrent.futures
+        import ssl
         import uuid
         import websockets
+
+        ssl_ctx = None
+        if ws_url.lower().startswith("wss://"):
+            try:
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ssl_ctx = ssl.create_default_context()
 
         async def _fetch() -> List[Dict[str, Any]]:
             sub_id = f"sub_{uuid.uuid4().hex[:8]}"
             events: List[Dict[str, Any]] = []
-            async with websockets.connect(ws_url, ping_interval=None, open_timeout=self.timeout) as ws:
+            async with websockets.connect(ws_url, ssl=ssl_ctx, ping_interval=None, open_timeout=self.timeout) as ws:
                 await ws.send(json.dumps(["REQ", sub_id, {"kinds": [kind]}]))
                 deadline = time.time() + self.timeout
                 while time.time() < deadline:

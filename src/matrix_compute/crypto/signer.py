@@ -105,6 +105,92 @@ def sign_message(private_key_hex: str, message: Union[str, bytes]) -> str:
     return (r_bytes + s_bytes).hex()
 
 
+# ============================================================================
+# BIP-340 Schnorr Signatures for Nostr (NIP-01)
+# ============================================================================
+
+_SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_SECP256K1_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+
+
+def _tagged_hash(tag: str, msg: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode("utf-8")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+
+
+def _point_add(p1: Optional[Tuple[int, int]], p2: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and y1 != y2:
+        return None
+    if x1 == x2:
+        m = (3 * x1 * x1 * pow(2 * y1, _SECP256K1_P - 2, _SECP256K1_P)) % _SECP256K1_P
+    else:
+        m = ((y2 - y1) * pow(x2 - x1, _SECP256K1_P - 2, _SECP256K1_P)) % _SECP256K1_P
+    x3 = (m * m - x1 - x2) % _SECP256K1_P
+    y3 = (m * (x1 - x3) - y1) % _SECP256K1_P
+    return (x3, y3)
+
+
+def _point_mul(pt: Tuple[int, int], scalar: int) -> Optional[Tuple[int, int]]:
+    res: Optional[Tuple[int, int]] = None
+    addend: Optional[Tuple[int, int]] = pt
+    while scalar:
+        if scalar & 1 and addend is not None:
+            res = _point_add(res, addend)
+        addend = _point_add(addend, addend)
+        scalar >>= 1
+    return res
+
+
+def schnorr_sign(private_key_hex: str, message: Union[str, bytes], aux_rand: Optional[bytes] = None) -> str:
+    """
+    Computes standard BIP-340 64-byte Schnorr signature over 32-byte message hash (or raw message).
+    Returns 128 hex characters.
+    """
+    if isinstance(message, str):
+        msg_bytes = bytes.fromhex(message) if len(message) == 64 else message.encode("utf-8")
+    else:
+        msg_bytes = bytes(message)
+
+    if len(msg_bytes) != 32:
+        msg_bytes = hashlib.sha256(msg_bytes).digest()
+
+    d0 = int(private_key_hex.strip(), 16)
+    if not (1 <= d0 <= SECP256K1_ORDER - 1):
+        raise ValueError("Invalid private key or out of range")
+
+    P = _point_mul(_SECP256K1_G, d0)
+    if P is None:
+        raise RuntimeError("Point multiplication failed")
+    d = SECP256K1_ORDER - d0 if P[1] % 2 != 0 else d0
+
+    if aux_rand is None:
+        aux_rand = secrets.token_bytes(32)
+
+    t = d.to_bytes(32, "big")
+    rand = _tagged_hash("BIP0340/aux", aux_rand)
+    k_prime = int.from_bytes(_tagged_hash("BIP0340/nonce", rand + t + msg_bytes), "big") % SECP256K1_ORDER
+    if k_prime == 0:
+        raise RuntimeError("k_prime is 0")
+    R = _point_mul(_SECP256K1_G, k_prime)
+    if R is None:
+        raise RuntimeError("Point multiplication failed")
+    k = SECP256K1_ORDER - k_prime if R[1] % 2 != 0 else k_prime
+    rx = R[0].to_bytes(32, "big")
+    px = P[0].to_bytes(32, "big")
+    e = int.from_bytes(_tagged_hash("BIP0340/challenge", rx + px + msg_bytes), "big") % SECP256K1_ORDER
+    sig = rx + ((k + e * d) % SECP256K1_ORDER).to_bytes(32, "big")
+    return sig.hex()
+
+
 def verify_signature(public_key_hex: str, message: Union[str, bytes], signature_hex: str) -> bool:
     """
     Verifies signature over message against public_key_hex.
@@ -261,6 +347,10 @@ class ClientSigner:
         return sign_message(self._privkey_hex, message)
 
     sign = sign_message
+
+    def sign_schnorr(self, message: Union[str, bytes]) -> str:
+        """Signs message with BIP-340 Schnorr signature for Nostr event signing."""
+        return schnorr_sign(self._privkey_hex, message)
 
     def sign_result(self, task_id: str, result_hash_or_bytes: Union[str, bytes]) -> str:
         """Convenience method signing (task_id, SHA256(result_bytes)) tuple."""

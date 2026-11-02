@@ -112,8 +112,8 @@ class NwcClient:
         serialized = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         event_id = hashlib.sha256(serialized).hexdigest().lower()
 
-        # Generate 64-byte compact signature
-        sig = self.signer.sign_message(bytes.fromhex(event_id))
+        # Generate 64-byte BIP-340 Schnorr signature for Nostr event
+        sig = self.signer.sign_schnorr(bytes.fromhex(event_id))
 
         return {
             "id": event_id,
@@ -146,6 +146,7 @@ class NwcClient:
         Connects to the relay, subscribes to Kind 23195 responses, publishes Kind 23194,
         and awaits matching response event.
         """
+        import ssl
         import uuid
         import websockets
 
@@ -153,9 +154,18 @@ class NwcClient:
         sub_id = f"nwc_{uuid.uuid4().hex[:8]}"
         start_time = int(time.time())
 
+        ssl_ctx = None
+        if self.params.relay_url.lower().startswith("wss://"):
+            try:
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ssl_ctx = ssl.create_default_context()
+
         # Connect with timeout
         async with websockets.connect(
             self.params.relay_url,
+            ssl=ssl_ctx,
             ping_interval=None,
             open_timeout=timeout,
         ) as ws:
@@ -317,6 +327,20 @@ class NwcClient:
             "status": "SETTLED",
             "fees_paid": result.get("fees_paid", 0),
         }
+
+    def get_balance(self, timeout_seconds: Optional[float] = None) -> int:
+        """
+        Dispatches NIP-47 get_balance request and returns balance in satoshis.
+        """
+        timeout = float(timeout_seconds if timeout_seconds is not None else self.timeout_seconds)
+        req = self.build_request_event("get_balance", {})
+        resp_event = self._run_async(self._dispatch_and_await_response(req, timeout))
+        decrypted_raw = nip04_decrypt(self.params.secret, self.wallet_pubkey, resp_event.get("content", ""))
+        data = json.loads(decrypted_raw)
+        if "error" in data and data["error"]:
+            raise PaymentError(f"NWC get_balance failed: {data['error']}")
+        msats = int(data.get("result", {}).get("balance", 0))
+        return msats // 1000
 
     def close(self) -> None:
         """Idempotent teardown for NwcClient."""

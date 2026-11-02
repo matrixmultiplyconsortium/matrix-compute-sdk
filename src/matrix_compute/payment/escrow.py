@@ -584,13 +584,35 @@ class EscrowManager:
 
             try:
                 if self.nwc_client is not None and escrow.payment_request:
-                    pay_res = self.nwc_client.pay_invoice(
-                        escrow.payment_request,
-                        expected_payment_hash=escrow.payment_hash,
-                    )
-                    if isinstance(pay_res, dict) and pay_res.get("preimage"):
-                        escrow._preimage = pay_res["preimage"]
-                    if hasattr(self.settlement_backend, "hold_invoice"):
+                    import threading
+                    def _async_nwc_pay() -> None:
+                        try:
+                            self.nwc_client.pay_invoice(
+                                escrow.payment_request,
+                                expected_payment_hash=escrow.payment_hash,
+                                timeout_seconds=self.default_timeout_seconds,
+                            )
+                        except Exception as nwc_ex:
+                            logger.debug("NWC background payment completed/result: %s", nwc_ex)
+
+                    t = threading.Thread(target=_async_nwc_pay, daemon=True)
+                    t.start()
+
+                    # Wait for settlement backend to observe HELD on LND
+                    poll_deadline = time.time() + min(20.0, self.default_timeout_seconds)
+                    held = False
+                    while time.time() < poll_deadline:
+                        if hasattr(self.settlement_backend, "get_status"):
+                            try:
+                                st = self.settlement_backend.get_status(escrow.payment_hash)
+                                if st is not None and str(st).strip().upper() == "HELD":
+                                    held = True
+                                    break
+                            except Exception:
+                                pass
+                        time.sleep(0.5)
+
+                    if not held and hasattr(self.settlement_backend, "hold_invoice"):
                         try:
                             self.settlement_backend.hold_invoice(escrow.payment_hash)
                         except Exception:

@@ -429,10 +429,11 @@ class DistributedMatmulCoordinator:
             total_gflops = sum(t.estimated_gflops for t in tasks)
             total_sats_spent += total_sats
 
-            worker_ln = getattr(
-                assigned_worker,
-                "lightning_routing_pubkey",
-                getattr(assigned_worker, "lightning_address", "worker@node"),
+            worker_ln = (
+                getattr(assigned_worker, "worker_lightning_address", None)
+                or getattr(assigned_worker, "lightning_routing_pubkey", None)
+                or getattr(assigned_worker, "lightning_address", None)
+                or "worker@node"
             )
             task_ids = [t.task_id for t in tasks]
             batch_job_id = f"{job_id}_b{g_idx}" if len(active_groups) > 1 else job_id
@@ -1001,16 +1002,18 @@ class DistributedMatmulCoordinator:
             getattr(assigned_worker, "multiaddr", getattr(assigned_worker, "target", "127.0.0.1:50051")),
         )
         sats_rate = getattr(assigned_worker, "sats_per_gflop", self.config.max_price_per_gflop)
-        worker_ln = getattr(
-            assigned_worker,
-            "lightning_routing_pubkey",
-            getattr(assigned_worker, "lightning_address", "worker@node"),
+        worker_ln = (
+            getattr(assigned_worker, "worker_lightning_address", None)
+            or getattr(assigned_worker, "lightning_routing_pubkey", None)
+            or getattr(assigned_worker, "lightning_address", None)
+            or "worker@node"
         )
 
         # Cost computation: 2 * N^2 * iterations FLOPs
         total_flops = 2.0 * float(n) * float(n) * float(num_iterations)
         total_gflops = total_flops / 1e9
-        total_sats = max(int(math.ceil(total_gflops * sats_rate)), 10)
+        min_task_sats = int(getattr(assigned_worker, "min_task_sats", 10))
+        total_sats = max(int(math.ceil(total_gflops * sats_rate)), min_task_sats)
 
         effective_ttl = int(lease_ttl_seconds or getattr(self.config, "lease_ttl_seconds", 3600))
         escrow_timeout = float(effective_ttl + 300)

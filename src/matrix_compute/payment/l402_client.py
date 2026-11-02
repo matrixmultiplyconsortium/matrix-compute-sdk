@@ -618,7 +618,7 @@ class HttpSettlementBackend:
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8080",
+        base_url: str = "https://settlement.matrix-compute.net",
         timeout: float = 10.0,
         timeout_seconds: Optional[float] = None,
         verification_key: Optional[str] = None,

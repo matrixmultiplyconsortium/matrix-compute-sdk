@@ -10,10 +10,10 @@ from matrix_compute.config import ClientConfig, get_default_config
 def test_default_config():
     """Asserts production default values."""
     config = ClientConfig()
-    assert config.nostr_relays == ["ws://127.0.0.1:8008"]
+    assert config.nostr_relays == ["wss://relay.matrix-compute.net"]
     assert config.min_worker_vram_mb == 4096
     assert config.max_price_per_gflop == 0.001
-    assert config.settlement_api_url == "http://127.0.0.1:8080"
+    assert config.settlement_api_url == "https://settlement.matrix-compute.net"
     assert config.settlement_verification_key == "settlement_secret_key_dev"
     assert config.connect_timeout_seconds == 5.0
     assert config.task_timeout_seconds == 30.0
