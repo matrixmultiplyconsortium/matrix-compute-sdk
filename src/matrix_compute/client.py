@@ -189,7 +189,7 @@ class MatrixComputeClient:
             ssl_enabled=self.config.ssl_enabled,
         )
         attestation_verifier = None
-        if self.config.offline_mock_mode and self.config.require_confidential_compute:
+        if (self.config.offline_mock_mode or self.config.required_tee_type == "simulated-cca") and self.config.require_confidential_compute:
             policy = VerificationPolicy()
             policy.add_trusted_root_pem(get_default_pki().root_cert_pem)
             policy.add_trusted_root_pem(get_default_amd_pki().root_cert_pem)

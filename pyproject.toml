@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-compute-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Production-grade consumer Python library and orchestrator for distributed matrix multiplication over decentralized compute nodes"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,6 +40,7 @@ dependencies = [
     "cryptography>=39.0.0",
     "coincurve>=18.0.0",
     "httpx>=0.24.0",
+    "websockets>=11.0",
 ]
 
 [project.optional-dependencies]
